@@ -32,6 +32,7 @@ st.title("학습하는 정산 시스템 🧠")
 
 init_db()
 mapping_dict = load_mappings()
+# 현재 DB에 있는 카테고리와 기본 목록 합치기
 full_category_list = sorted(list(set(DEFAULT_CATEGORIES + list(mapping_dict.values()))))
 
 uploaded_file = st.file_uploader("엑셀 파일을 업로드하세요", type=["xlsx"])
@@ -39,49 +40,83 @@ uploaded_file = st.file_uploader("엑셀 파일을 업로드하세요", type=["x
 if uploaded_file:
     df = pd.read_excel(uploaded_file)
     
+    # 내역 컬럼 자동 찾기
     cols = list(df.columns)
-    desc_col = st.selectbox("내역(설명)이 적힌 컬럼을 확인하세요", cols, index=0)
+    default_desc_idx = 0
+    for i, col in enumerate(cols):
+        if any(k in str(col) for k in ["내역", "내용", "사용처", "가맹점", "적요"]):
+            default_desc_idx = i
+            break
+    
+    desc_col = st.selectbox("내역(설명)이 적힌 컬럼을 확인하세요", cols, index=default_desc_idx)
     
     if desc_col:
-        # 매핑 적용
+        # 1차 분류 적용
         df['카테고리'] = df[desc_col].map(mapping_dict).fillna("미분류")
         
-        st.subheader("📊 정산 결과 미리보기 (카테고리 칸을 클릭해 수정 가능)")
+        st.subheader("📊 정산 결과 미리보기 (카테고리 칸 클릭 수정 가능)")
         
-        # --- 핵심: 수정 가능한 표(Data Editor) 사용 ---
+        # --- 방법 A: 표에서 직접 수정 기능 ---
         edited_df = st.data_editor(
             df,
             column_config={
                 "카테고리": st.column_config.SelectboxColumn(
                     "카테고리",
-                    help="분류를 선택하세요",
                     options=full_category_list,
                     required=True,
                 )
             },
             use_container_width=True,
-            key="data_editor"
+            key="main_editor"
         )
 
-        # --- 표에서 수정한 내용 실시간 DB 저장 ---
-        # 사용자가 표에서 카테고리를 바꿨는지 체크합니다.
-        if st.session_state.get("data_editor"):
-            edits = st.session_state["data_editor"]["edited_rows"]
+        # 표 수정 실시간 반영 로직
+        if st.session_state.get("main_editor"):
+            edits = st.session_state["main_editor"]["edited_rows"]
             if edits:
                 for row_idx, changes in edits.items():
                     if "카테고리" in changes:
                         new_cat = changes["카테고리"]
                         desc_val = df.iloc[int(row_idx)][desc_col]
                         save_mapping(desc_val, new_cat)
-                
-                # 저장이 완료되면 화면을 다시 불러와서 '미분류' 경고를 업데이트합니다.
-                st.toast("변경사항이 DB에 저장되어 학습되었습니다! ✅")
+                st.toast("표 수정 내용이 저장되었습니다! ✅")
                 st.rerun()
 
-        # --- 3. 하단 미분류 내역 처리 섹션 ---
+        # --- 방법 B: 하단 집중 분류 섹션 ---
         unclassified = edited_df[edited_df['카테고리'] == "미분류"][desc_col].unique()
         
+        st.divider()
         if len(unclassified) > 0:
-            st.divider()
-            st.warning(f"🔎 아직 분류되지 않은 내역이 {len(unclassified)}건 있습니다. 위 표에서 직접 선택하거나 아래에서 지정하세요.")
-            # (이전의 일괄 학습 섹션은 그대로 유지하거나 표 수정을 주력으로 사용하시면 됩니다.)
+            st.warning(f"🔎 아직 분류되지 않은 내역이 **{len(unclassified)}**건 있습니다.")
+            
+            # 분류할 대상 (가장 첫 번째 미분류 항목)
+            target = unclassified[0]
+            
+            with st.container(border=True):
+                st.write(f"현재 분류 중인 항목: **{target}**")
+                
+                col1, col2, col3 = st.columns([2, 2, 1])
+                
+                with col1:
+                    selected_cat = st.selectbox(
+                        "목록에서 선택", 
+                        full_category_list + ["(직접 입력)"],
+                        key="select_box"
+                    )
+                
+                with col2:
+                    if selected_cat == "(직접 입력)":
+                        user_input_cat = st.text_input("새 카테고리 입력", key="text_input")
+                    else:
+                        user_input_cat = ""
+                
+                with col3:
+                    st.write("") # 간격 맞추기용
+                    if st.button("이 내역 기억하기", type="primary", use_container_width=True):
+                        final_cat = user_input_cat if selected_cat == "(직접 입력)" else selected_cat
+                        if final_cat:
+                            save_mapping(target, final_cat)
+                            st.success(f"'{target}'을(를) '{final_cat}'(으)로 학습했습니다.")
+                            st.rerun()
+        else:
+            st.success("✅ 모든 내역의 분류가 완료되었습니다!")

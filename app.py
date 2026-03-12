@@ -2,19 +2,15 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- 1. 구글 시트 연결 및 보안 설정 ---
+# --- 1. 구글 시트 연결 설정 ---
 def get_gspread_client():
     try:
-        # Streamlit Secrets에 저장한 JSON 데이터를 불러옵니다.
         creds_dict = st.secrets["gcp_service_account"]
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         return gspread.authorize(creds)
     except Exception as e:
@@ -25,201 +21,178 @@ def get_worksheet(sheet_name):
     client = get_gspread_client()
     if not client: return None
     try:
-        # 구글 시트 이름이 'settlement_db'와 정확히 일치해야 합니다.
         sh = client.open("settlement_db")
         try:
-            ws = sh.worksheet(sheet_name)
-            return ws
+            return sh.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            # 시트가 없으면 자동으로 제목(헤더)과 함께 생성합니다.
             if sheet_name == "mapping":
-                new_ws = sh.add_worksheet(title="mapping", rows="100", cols="2")
-                new_ws.append_row(["description", "category"])
-                return new_ws
+                ws = sh.add_worksheet(title="mapping", rows="100", cols="2")
+                ws.append_row(["description", "category"])
+                return ws
             else:
-                new_ws = sh.add_worksheet(title="history", rows="100", cols="5")
-                new_ws.append_row(["report_name", "date", "category", "income", "expense"])
-                return new_ws
+                ws = sh.add_worksheet(title="history", rows="1000", cols="5")
+                ws.append_row(["report_name", "date", "category", "income", "expense"])
+                return ws
     except Exception as e:
-        st.error(f"⚠️ 구글 시트 접속 실패: 'settlement_db' 시트를 생성하고 서비스 계정 이메일을 초대했는지 확인하세요.")
+        st.error(f"⚠️ 구글 시트 'settlement_db' 접속 실패. 공유 설정을 확인하세요.")
         return None
 
-# --- 2. 데이터 처리 및 학습 로직 (KeyError 방어형) ---
+# --- 2. 데이터 처리 함수 ---
 def load_mappings():
     ws = get_worksheet("mapping")
     if not ws: return {}
     data = ws.get_all_records()
     if not data: return {}
-    
     df = pd.DataFrame(data)
-    # 컬럼명이 정확히 있는지 확인하여 에러를 방지합니다.
-    if 'description' in df.columns and 'category' in df.columns:
-        return dict(zip(df['description'], df['category']))
-    return {}
+    return dict(zip(df['description'], df['category'])) if 'description' in df.columns else {}
 
 def save_mapping(desc, cat):
     ws = get_worksheet("mapping")
     if not ws: return
     try:
         cell = ws.find(desc)
-        if cell:
-            ws.update_cell(cell.row, 2, cat)
-        else:
-            ws.append_row([desc, cat])
-    except:
-        ws.append_row([desc, cat])
+        if cell: ws.update_cell(cell.row, 2, cat)
+        else: ws.append_row([desc, cat])
+    except: ws.append_row([desc, cat])
 
-def save_report_to_gsheet(name, df):
+def save_report(name, df):
     ws = get_worksheet("history")
     if not ws: return
     date_now = datetime.now().strftime("%Y-%m-%d")
     summary = df.groupby('카테고리').agg({'입금금액':'sum', '지출금액':'sum'}).reset_index()
-    
-    # 기존에 같은 이름으로 저장된 리포트가 있다면 삭제(업데이트 개념)
     try:
         cells = ws.findall(name)
         rows_to_delete = sorted(list(set([c.row for c in cells])), reverse=True)
-        for r in rows_to_delete:
-            ws.delete_rows(r)
-    except:
-        pass
-        
+        for r in rows_to_delete: ws.delete_rows(r)
+    except: pass
     for _, row in summary.iterrows():
         ws.append_row([name, date_now, row['카테고리'], row['입금금액'], row['지출금액']])
 
-# --- 3. 앱 메인 화면 구성 ---
-st.set_page_config(page_title="HuckJun's 비즈니스 대시보드", layout="wide")
+# --- 3. 시각화 모듈 (공통 사용) ---
+def display_dashboard(df, v_rate, i_rate, exclude):
+    f_df = df[~df['카테고리'].isin(exclude)].copy()
+    t_in = f_df["입금금액"].sum()
+    t_out = f_df["지출금액"].sum()
+    r_profit = t_in - t_out
+    tax = (t_in * v_rate/100) + (max(0, r_profit) * i_rate/100)
+    n_profit = r_profit - tax
+    margin = (n_profit / t_in * 100) if t_in > 0 else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("총 매출", f"{t_in:,.0f}원")
+    k2.metric("사업 지출", f"-{t_out:,.0f}원")
+    k3.metric("세금 예비비", f"-{tax:,.0f}원")
+    k4.metric("최종 순이익", f"{n_profit:,.0f}원", f"{margin:.1f}%")
+
+    st.divider()
+    
+    st.subheader("📊 지출 카테고리별 상세 분석")
+    col1, col2 = st.columns(2)
+    
+    exp_df = f_df[f_df['지출금액'] > 0].groupby('카테고리')['지출금액'].sum().reset_index().sort_values('지출금액', ascending=False)
+    
+    with col1:
+        fig_bar = px.bar(exp_df, x='지출금액', y='카테고리', orientation='h', 
+                         title="카테고리별 지출 금액 (비교)", text_auto=',.0f',
+                         color='지출금액', color_continuous_scale='Reds')
+        st.plotly_chart(fig_bar, use_container_width=True)
+        
+    with col2:
+        fig_pie = px.pie(exp_df, values='지출금액', names='카테고리', title="지출 비중 (%)", hole=0.4)
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+# --- 4. 앱 화면 구성 ---
+st.set_page_config(page_title="HuckJun's 비즈니스 인텔리전스", layout="wide")
 mapping_dict = load_mappings()
-DEFAULT_CATEGORIES = ["사입", "부자재", "세금", "택배비", "광고비", "생활 및 기타", "식비", "입금", "기타"]
-INVESTMENT_CATS = ["사입", "부자재", "광고비"]
-full_category_list = sorted(list(set(DEFAULT_CATEGORIES + list(mapping_dict.values()))))
+DEFAULT_CATS = ["사입", "부자재", "세금", "택배비", "광고비", "생활 및 기타", "식비", "입금", "기타"]
+full_cat_list = sorted(list(set(DEFAULT_CATS + list(mapping_dict.values()))))
 
 with st.sidebar:
-    st.header("📂 프로젝트 관리")
-    mode = st.radio("작업 선택", ["새 정산하기", "과거 내역 확인", "보관함 관리"])
+    st.header("📂 메뉴")
+    mode = st.radio("이동", ["새 정산하기", "과거 내역 및 추세"])
     st.divider()
-    st.header("⚙️ 분석 필터")
-    exclude_cats = st.multiselect("정산 제외 항목", full_category_list, default=["기타", "생활 및 기타"])
-    vat_rate = st.slider("부가세 예비비 (%)", 0, 10, 7)
-    income_tax_rate = st.slider("소득세 예비비 (%)", 0, 45, 15)
+    exclude_cats = st.multiselect("분석 제외", full_cat_list, default=["기타", "생활 및 기타"])
+    v_rate = st.slider("부가세 (%)", 0, 10, 7)
+    i_rate = st.slider("소득세 (%)", 0, 45, 15)
 
-# [모드 1] 새 정산하기
 if mode == "새 정산하기":
-    project_title = st.text_input("📝 이번 정산 프로젝트 제목", value=f"{datetime.now().strftime('%Y-%m')} 정산")
-    st.title(f"🚀 {project_title}")
-
-    uploaded_files = st.file_uploader("엑셀 파일들을 선택하세요", type=["xlsx"], accept_multiple_files=True)
-    all_dfs = []
-
-    if uploaded_files:
-        for i, file in enumerate(uploaded_files):
-            with st.expander(f"📄 {file.name} 컬럼 설정", expanded=(i==0)):
-                df_temp = pd.read_excel(file)
-                options = ["없음"] + list(df_temp.columns)
+    title = st.text_input("📝 정산 제목", value=f"{datetime.now().strftime('%Y-%m')} 정산")
+    files = st.file_uploader("엑셀 파일 선택", type=["xlsx"], accept_multiple_files=True)
+    
+    if files:
+        all_data = []
+        for i, f in enumerate(files):
+            with st.expander(f"📄 {f.name} 매핑"):
+                df_t = pd.read_excel(f)
+                opts = ["없음"] + list(df_t.columns)
                 c1, c2, c3 = st.columns(3)
-                d_col = c1.selectbox(f"내역 열 ({file.name})", options, key=f"d_{i}", index=1 if len(options)>1 else 0)
-                e_col = c2.selectbox(f"지출 금액 ({file.name})", options, key=f"e_{i}", index=0)
-                i_col = c3.selectbox(f"입금 금액 ({file.name})", options, key=f"i_{i}", index=0)
+                d_c = c1.selectbox(f"내역", opts, key=f"d_{i}", index=1)
+                e_c = c2.selectbox(f"지출", opts, key=f"e_{i}", index=0)
+                i_c = c3.selectbox(f"입금", opts, key=f"i_{i}", index=0)
                 
-                # 데이터 가공 (KeyError 방지 로직)
-                sub_df = pd.DataFrame()
-                sub_df["내역"] = df_temp[d_col].astype(str) if d_col != "없음" else ["내역 없음"]*len(df_temp)
-                sub_df["지출금액"] = pd.to_numeric(df_temp[e_col], errors='coerce').fillna(0) if e_col != "없음" else 0.0
-                sub_df["입금금액"] = pd.to_numeric(df_temp[i_col], errors='coerce').fillna(0) if i_col != "없음" else 0.0
-                all_dfs.append(sub_df)
+                tmp = pd.DataFrame()
+                tmp["내역"] = df_t[d_c].astype(str) if d_c != "없음" else ["없음"]*len(df_t)
+                tmp["지출금액"] = pd.to_numeric(df_t[e_c], errors='coerce').fillna(0) if e_c != "없음" else 0.0
+                tmp["입금금액"] = pd.to_numeric(df_t[i_c], errors='coerce').fillna(0) if i_c != "없음" else 0.0
+                all_data.append(tmp)
 
-        if all_dfs:
-            combined_df = pd.concat(all_dfs, ignore_index=True)
-            combined_df['카테고리'] = combined_df["내역"].map(mapping_dict).fillna("미분류")
+        if all_data:
+            df_main = pd.concat(all_data, ignore_index=True)
+            df_main['카테고리'] = df_main["내역"].map(mapping_dict).fillna("미분류")
             
-            # --- 필터링 및 계산 ---
-            filtered_df = combined_df[~combined_df['카테고리'].isin(exclude_cats)].copy()
-            total_in = filtered_df["입금금액"].sum()
-            total_out = filtered_df["지출금액"].sum()
-            raw_profit = total_in - total_out
-            tax_val = (total_in * vat_rate/100) + (max(0, raw_profit) * income_tax_rate/100)
-            net_profit = raw_profit - tax_val
-            margin = (net_profit / total_in * 100) if total_in > 0 else 0
-
-            # KPI 표시
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("총 매출", f"{total_in:,.0f}원")
-            k2.metric("사업 지출", f"-{total_out:,.0f}원")
-            k3.metric("세금 예비비", f"-{tax_val:,.0f}원")
-            k4.metric("최종 순이익", f"{net_profit:,.0f}원", f"{margin:.1f}%")
-
-            st.divider()
+            display_dashboard(df_main, v_rate, i_rate, exclude_cats)
             
-            # 데이터 편집기
-            st.subheader("📝 상세 내역 수정")
-            edited_df = st.data_editor(
-                combined_df, 
-                column_config={"카테고리": st.column_config.SelectboxColumn("카테고리", options=full_category_list)},
-                use_container_width=True,
-                key="main_editor"
-            )
+            st.subheader("📝 상세 수정 및 저장")
+            edited = st.data_editor(df_main, column_config={"카테고리": st.column_config.SelectboxColumn("카테고리", options=full_cat_list)}, use_container_width=True)
             
-            if st.button("💾 구글 시트에 이 정산 내역 보관", type="primary"):
-                save_report_to_gsheet(project_title, edited_df)
-                st.success(f"'{project_title}' 내역이 구글 시트에 안전하게 보관되었습니다!")
+            if st.button("💾 구글 시트에 최종 저장", type="primary"):
+                save_report(title, edited)
+                st.success("데이터 보관 완료!")
 
-            # 분류 학습 섹션
-            uncl = edited_df[edited_df['카테고리'] == "미분류"]["내역"].unique()
+            uncl = edited[edited['카테고리'] == "미분류"]["내역"].unique()
             if len(uncl) > 0:
-                st.divider()
-                st.warning(f"🔎 미분류 내역 {len(uncl)}건 남음")
-                target = uncl[0]
                 with st.container(border=True):
-                    st.write(f"현재 분류 학습 항목: **{target}**")
+                    st.write(f"미분류 학습: **{uncl[0]}**")
                     sc1, sc2, sc3 = st.columns([2, 2, 1])
-                    sel = sc1.selectbox("카테고리 선택", full_category_list + ["(직접 입력)"], key="bot_sel")
-                    val = sc2.text_input("새 카테고리 이름") if sel == "(직접 입력)" else ""
-                    if sc3.button("학습 및 기억하기", use_container_width=True):
-                        save_mapping(target, val if sel == "(직접 입력)" else sel)
+                    sel = sc1.selectbox("카테고리", full_cat_list + ["(직접 입력)"], key="l_sel")
+                    val = sc2.text_input("직접 입력") if sel == "(직접 입력)" else ""
+                    if sc3.button("기억하기"):
+                        save_mapping(uncl[0], val if sel == "(직접 입력)" else sel)
                         st.rerun()
 
-            # 시각화
-            st.subheader("📊 지출 분석 요약")
-            g1, g2 = st.columns(2)
-            exp_only = edited_df[~edited_df['카테고리'].isin(["입금"] + exclude_cats)]
-            exp_only["지출성격"] = exp_only["카테고리"].apply(lambda x: "투자 (성장)" if x in INVESTMENT_CATS else "소비 (운영)")
-            
-            with g1:
-                st.plotly_chart(px.pie(exp_only, values="지출금액", names="지출성격", title="투자 vs 소비 비중"), use_container_width=True)
-            with g2:
-                fig_gauge = go.Figure(go.Indicator(mode="gauge+number", value=margin, title={'text': "최종 수익률 (%)"},
-                                                 gauge={'axis':{'range':[None, 50]}, 'bar':{'color':"darkblue"}}))
-                st.plotly_chart(fig_gauge, use_container_width=True)
-
-# [모드 2] 과거 내역 확인
-elif mode == "과거 내역 확인":
-    st.title("📜 보관된 정산 보고서")
+elif mode == "과거 내역 및 추세":
+    st.title("📜 과거 리포트 및 지출 추세 분석")
     ws = get_worksheet("history")
     if ws:
-        data = ws.get_all_records()
-        if data:
-            df_h = pd.DataFrame(data)
-            report_names = df_h['report_name'].unique()
-            selected = st.selectbox("불러올 보고서 선택", report_names)
+        h_data = ws.get_all_records()
+        if h_data:
+            df_h = pd.DataFrame(h_data)
+            reports = sorted(df_h['report_name'].unique(), reverse=True)
             
-            report_df = df_h[df_h['report_name'] == selected]
-            st.table(report_df[['category', 'income', 'expense']])
-        else:
-            st.info("보관함이 비어 있습니다.")
+            tab1, tab2 = st.tabs(["📄 리포트 상세 보기", "📈 전월 대비 추세"])
+            
+            with tab1:
+                selected = st.selectbox("보고서 선택", reports)
+                r_df = df_h[df_h['report_name'] == selected].rename(columns={'income':'입금금액', 'expense':'지출금액', 'category':'카테고리'})
+                display_dashboard(r_df, v_rate, i_rate, exclude_cats)
+                with st.expander("원본 요약 데이터 보기"):
+                    st.dataframe(r_df, use_container_width=True)
 
-# [모드 3] 보관함 관리
-elif mode == "보관함 관리":
-    st.title("🛠️ 정산 프로젝트 관리 (삭제/수정)")
-    ws = get_worksheet("history")
-    if ws:
-        data = ws.get_all_records()
-        if data:
-            df_h = pd.DataFrame(data)
-            report_names = df_h['report_name'].unique()
-            target = st.selectbox("삭제할 프로젝트 선택", report_names)
-            if st.button("🚨 이 프로젝트 영구 삭제", use_container_width=True):
-                cells = ws.findall(target)
-                rows_to_delete = sorted(list(set([c.row for c in cells])), reverse=True)
-                for r in rows_to_delete: ws.delete_rows(r)
-                st.success("삭제 완료")
-                st.rerun()
+            with tab2:
+                if len(reports) >= 2:
+                    st.subheader(f"🔄 {reports[0]} vs {reports[1]} 비교")
+                    curr = df_h[df_h['report_name'] == reports[0]].groupby('category')['expense'].sum()
+                    prev = df_h[df_h['report_name'] == reports[1]].groupby('category')['expense'].sum()
+                    
+                    comp_df = pd.DataFrame({'이번달': curr, '지난달': prev}).fillna(0)
+                    comp_df['차이'] = comp_df['이번달'] - comp_df['지난달']
+                    comp_df['증감률(%)'] = (comp_df['차이'] / comp_df['지난달'] * 100).replace([float('inf'), -float('inf')], 0).fillna(0)
+                    
+                    st.table(comp_df.style.format("{:,.0f}").background_gradient(subset=['차이'], cmap='RdYlGn_r'))
+                    
+                    fig_trend = go.Figure()
+                    fig_trend.add_trace(go.Bar(name='지난달', x=comp_df.index, y=comp_df['지난달']))
+                    fig_trend.add_trace(go.Bar(name='이번달', x=comp_df.index, y=comp_df['이번달']))
+                    st.plotly_chart(fig_trend, use_container_width=True)
+                else:
+                    st.info("비교할 과거 데이터가 부족합니다. 최소 2개월 이상의 데이터를 저장해 주세요.")

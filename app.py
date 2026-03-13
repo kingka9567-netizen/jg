@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -34,7 +34,7 @@ def get_worksheet(sheet_name):
                 ws.append_row(["report_name", "date", "category", "income", "expense"])
                 return ws
     except Exception as e:
-        st.error(f"⚠️ 구글 시트 'settlement_db' 접속 실패. 공유 설정을 확인하세요.")
+        st.error(f"⚠️ 구글 시트 접속 실패. 공유 설정 및 시트 이름을 확인하세요.")
         return None
 
 # --- 2. 데이터 처리 함수 ---
@@ -68,8 +68,8 @@ def save_report(name, df):
     for _, row in summary.iterrows():
         ws.append_row([name, date_now, row['카테고리'], row['입금금액'], row['지출금액']])
 
-# --- 3. 시각화 모듈 (공통 사용) ---
-def display_dashboard(df, v_rate, i_rate, exclude):
+# --- 3. 핵심 계산 로직 (공통) ---
+def calculate_metrics(df, v_rate, i_rate, exclude):
     f_df = df[~df['카테고리'].isin(exclude)].copy()
     t_in = f_df["입금금액"].sum()
     t_out = f_df["지출금액"].sum()
@@ -77,52 +77,30 @@ def display_dashboard(df, v_rate, i_rate, exclude):
     tax = (t_in * v_rate/100) + (max(0, r_profit) * i_rate/100)
     n_profit = r_profit - tax
     margin = (n_profit / t_in * 100) if t_in > 0 else 0
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("총 매출", f"{t_in:,.0f}원")
-    k2.metric("사업 지출", f"-{t_out:,.0f}원")
-    k3.metric("세금 예비비", f"-{tax:,.0f}원")
-    k4.metric("최종 순이익", f"{n_profit:,.0f}원", f"{margin:.1f}%")
-
-    st.divider()
-    
-    st.subheader("📊 지출 카테고리별 상세 분석")
-    col1, col2 = st.columns(2)
-    
-    exp_df = f_df[f_df['지출금액'] > 0].groupby('카테고리')['지출금액'].sum().reset_index().sort_values('지출금액', ascending=False)
-    
-    with col1:
-        fig_bar = px.bar(exp_df, x='지출금액', y='카테고리', orientation='h', 
-                         title="카테고리별 지출 금액 (비교)", text_auto=',.0f',
-                         color='지출금액', color_continuous_scale='Reds')
-        st.plotly_chart(fig_bar, use_container_width=True)
-        
-    with col2:
-        fig_pie = px.pie(exp_df, values='지출금액', names='카테고리', title="지출 비중 (%)", hole=0.4)
-        st.plotly_chart(fig_pie, use_container_width=True)
+    return t_in, t_out, tax, n_profit, margin, f_df
 
 # --- 4. 앱 화면 구성 ---
-st.set_page_config(page_title="HuckJun's 비즈니스 인텔리전스", layout="wide")
+st.set_page_config(page_title="HuckJun's 비즈니스 대시보드", layout="wide")
 mapping_dict = load_mappings()
 DEFAULT_CATS = ["사입", "부자재", "세금", "택배비", "광고비", "생활 및 기타", "식비", "입금", "기타"]
 full_cat_list = sorted(list(set(DEFAULT_CATS + list(mapping_dict.values()))))
 
 with st.sidebar:
     st.header("📂 메뉴")
-    mode = st.radio("이동", ["새 정산하기", "과거 내역 및 추세"])
+    mode = st.radio("이동", ["새 정산하기", "과거 내역 및 추세 비교"])
     st.divider()
-    exclude_cats = st.multiselect("분석 제외", full_cat_list, default=["기타", "생활 및 기타"])
-    v_rate = st.slider("부가세 (%)", 0, 10, 7)
-    i_rate = st.slider("소득세 (%)", 0, 45, 15)
+    exclude_cats = st.multiselect("분석 제외 카테고리", full_cat_list, default=["기타", "생활 및 기타"])
+    v_rate = st.slider("부가세 예비비 (%)", 0, 10, 7)
+    i_rate = st.slider("소득세 예비비 (%)", 0, 45, 15)
 
 if mode == "새 정산하기":
-    title = st.text_input("📝 정산 제목", value=f"{datetime.now().strftime('%Y-%m')} 정산")
-    files = st.file_uploader("엑셀 파일 선택", type=["xlsx"], accept_multiple_files=True)
+    title = st.text_input("📝 정산 제목 설정", value=f"{datetime.now().strftime('%Y-%m')} 정산")
+    files = st.file_uploader("엑셀 파일 업로드", type=["xlsx"], accept_multiple_files=True)
     
     if files:
         all_data = []
         for i, f in enumerate(files):
-            with st.expander(f"📄 {f.name} 매핑"):
+            with st.expander(f"📄 {f.name} 설정"):
                 df_t = pd.read_excel(f)
                 opts = ["없음"] + list(df_t.columns)
                 c1, c2, c3 = st.columns(3)
@@ -140,14 +118,29 @@ if mode == "새 정산하기":
             df_main = pd.concat(all_data, ignore_index=True)
             df_main['카테고리'] = df_main["내역"].map(mapping_dict).fillna("미분류")
             
-            display_dashboard(df_main, v_rate, i_rate, exclude_cats)
+            t_in, t_out, tax, n_profit, margin, f_df = calculate_metrics(df_main, v_rate, i_rate, exclude_cats)
             
-            st.subheader("📝 상세 수정 및 저장")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("총 매출", f"{t_in:,.0f}원")
+            k2.metric("사업 지출", f"-{t_out:,.0f}원")
+            k3.metric("세금 예비비", f"-{tax:,.0f}원")
+            k4.metric("최종 순이익", f"{n_profit:,.0f}원", f"{margin:.1f}%")
+
+            st.divider()
+            st.subheader("📊 지출 분석 요약")
+            col1, col2 = st.columns(2)
+            exp_df = f_df[f_df['지출금액'] > 0].groupby('카테고리')['지출금액'].sum().reset_index().sort_values('지출금액', ascending=False)
+            with col1:
+                st.plotly_chart(px.bar(exp_df, x='지출금액', y='카테고리', orientation='h', title="카테고리별 지출 금액", text_auto=',.0f'), use_container_width=True)
+            with col2:
+                st.plotly_chart(px.pie(exp_df, values='지출금액', names='카테고리', title="지출 비중 (%)", hole=0.4), use_container_width=True)
+
+            st.subheader("📝 상세 내역 수정")
             edited = st.data_editor(df_main, column_config={"카테고리": st.column_config.SelectboxColumn("카테고리", options=full_cat_list)}, use_container_width=True)
             
-            if st.button("💾 구글 시트에 최종 저장", type="primary"):
+            if st.button("💾 구글 시트에 저장", type="primary"):
                 save_report(title, edited)
-                st.success("데이터 보관 완료!")
+                st.success("저장 완료!")
 
             uncl = edited[edited['카테고리'] == "미분류"]["내역"].unique()
             if len(uncl) > 0:
@@ -160,39 +153,54 @@ if mode == "새 정산하기":
                         save_mapping(uncl[0], val if sel == "(직접 입력)" else sel)
                         st.rerun()
 
-elif mode == "과거 내역 및 추세":
-    st.title("📜 과거 리포트 및 지출 추세 분석")
+elif mode == "과거 내역 및 추세 비교":
+    st.title("📜 리포트 대조 및 추세 분석")
     ws = get_worksheet("history")
     if ws:
         h_data = ws.get_all_records()
         if h_data:
-            df_h = pd.DataFrame(h_data)
+            df_h = pd.DataFrame(h_data).rename(columns={'income':'입금금액', 'expense':'지출금액', 'category':'카테고리'})
             reports = sorted(df_h['report_name'].unique(), reverse=True)
             
-            tab1, tab2 = st.tabs(["📄 리포트 상세 보기", "📈 전월 대비 추세"])
+            c1, c2 = st.columns(2)
+            target_a = c1.selectbox("기준 데이터 (과거)", reports, index=min(1, len(reports)-1))
+            target_b = c2.selectbox("대조 데이터 (최신)", reports, index=0)
             
-            with tab1:
-                selected = st.selectbox("보고서 선택", reports)
-                r_df = df_h[df_h['report_name'] == selected].rename(columns={'income':'입금금액', 'expense':'지출금액', 'category':'카테고리'})
-                display_dashboard(r_df, v_rate, i_rate, exclude_cats)
-                with st.expander("원본 요약 데이터 보기"):
-                    st.dataframe(r_df, use_container_width=True)
-
-            with tab2:
-                if len(reports) >= 2:
-                    st.subheader(f"🔄 {reports[0]} vs {reports[1]} 비교")
-                    curr = df_h[df_h['report_name'] == reports[0]].groupby('category')['expense'].sum()
-                    prev = df_h[df_h['report_name'] == reports[1]].groupby('category')['expense'].sum()
-                    
-                    comp_df = pd.DataFrame({'이번달': curr, '지난달': prev}).fillna(0)
-                    comp_df['차이'] = comp_df['이번달'] - comp_df['지난달']
-                    comp_df['증감률(%)'] = (comp_df['차이'] / comp_df['지난달'] * 100).replace([float('inf'), -float('inf')], 0).fillna(0)
-                    
-                    st.table(comp_df.style.format("{:,.0f}").background_gradient(subset=['차이'], cmap='RdYlGn_r'))
-                    
-                    fig_trend = go.Figure()
-                    fig_trend.add_trace(go.Bar(name='지난달', x=comp_df.index, y=comp_df['지난달']))
-                    fig_trend.add_trace(go.Bar(name='이번달', x=comp_df.index, y=comp_df['이번달']))
-                    st.plotly_chart(fig_trend, use_container_width=True)
-                else:
-                    st.info("비교할 과거 데이터가 부족합니다. 최소 2개월 이상의 데이터를 저장해 주세요.")
+            st.divider()
+            
+            # 각 데이터 계산
+            df_a = df_h[df_h['report_name'] == target_a]
+            df_b = df_h[df_h['report_name'] == target_b]
+            
+            m_a = calculate_metrics(df_a, v_rate, i_rate, exclude_cats)
+            m_b = calculate_metrics(df_b, v_rate, i_rate, exclude_cats)
+            
+            # KPI 추세 비교 (Metric Delta)
+            st.subheader("📈 주요 지표 변화")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("총 매출 변화", f"{m_b[0]:,.0f}원", f"{m_b[0] - m_a[0]:+,.0f}원")
+            k2.metric("총 지출 변화", f"-{m_b[1]:,.0f}원", f"{(m_b[1] - m_a[1])*-1:+,.0f}원", delta_color="inverse")
+            k3.metric("최종 순이익 변화", f"{m_b[3]:,.0f}원", f"{m_b[3] - m_a[3]:+,.0f}원")
+            
+            st.divider()
+            
+            # 카테고리별 지출 비교
+            st.subheader("📊 카테고리별 지출 상세 대조")
+            exp_a = m_a[5][m_a[5]['지출금액'] > 0].groupby('카테고리')['지출금액'].sum()
+            exp_b = m_b[5][m_b[5]['지출금액'] > 0].groupby('카테고리')['지출금액'].sum()
+            
+            comp_df = pd.DataFrame({target_a: exp_a, target_b: exp_b}).fillna(0)
+            comp_df['차이'] = comp_df[target_b] - comp_df[target_a]
+            comp_df['증감률(%)'] = (comp_df['차이'] / comp_df[target_a] * 100).replace([float('inf'), -float('inf')], 0).fillna(0)
+            
+            t1, t2 = st.tabs(["📉 비교 데이터 테이블", "📊 비교 막대 그래프"])
+            with t1:
+                st.table(comp_df.style.format("{:,.0f}").background_gradient(subset=['차이'], cmap='RdYlGn_r'))
+            with t2:
+                fig_comp = go.Figure()
+                fig_comp.add_trace(go.Bar(name=target_a, x=comp_df.index, y=comp_df[target_a]))
+                fig_comp.add_trace(go.Bar(name=target_b, x=comp_df.index, y=comp_df[target_b]))
+                fig_comp.update_layout(barmode='group', title=f"{target_a} vs {target_b} 지출 비교")
+                st.plotly_chart(fig_comp, use_container_width=True)
+        else:
+            st.info("보관함에 데이터가 없습니다. 먼저 정산을 진행하고 저장해 주세요.")

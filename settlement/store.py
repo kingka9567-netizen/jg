@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from .core import validate_rows, digest
+from .checks import coverage_checks
 
 class ConflictError(ValueError):
     pass
@@ -80,7 +81,7 @@ class Store:
         self.execute(c, 'INSERT INTO settlement_audit(id,created_at,payload) VALUES (?,?,?)',
                      (digest([now, payload]), now, json.dumps(payload, ensure_ascii=False)))
 
-    def import_rows(self, batches, rows, rules=(), profiles=()):
+    def import_rows(self, batches, rows, rules=(), profiles=(), coverage_confirmed=False):
         validate_rows(rows)
         batch_ids = {b['id'] for b in batches}
         if {r['batch_id'] for r in rows} != batch_ids:
@@ -89,7 +90,9 @@ class Store:
             with self.connection(write=True) as c:
                 if self.pg:
                     self.execute(c, 'SELECT pg_advisory_xact_lock(716294018)')
-                current_fingerprints={json.loads(p)['fingerprint'] for (p,) in self.execute(c,'SELECT payload FROM settlement_transactions').fetchall()}
+                current_rows=[json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_transactions').fetchall()]
+                self._check_coverage(c,rows,current_rows,coverage_confirmed)
+                current_fingerprints={r['fingerprint'] for r in current_rows}
                 if any(r['fingerprint'] in current_fingerprints and not r.get('duplicate') for r in rows):
                     raise ConflictError('검토 후 다른 업로드에서 같은 거래가 저장되었습니다. 새로 불러와 중복 후보를 확인하세요.')
                 for b in batches:
@@ -103,16 +106,20 @@ class Store:
                     self._setting(c, 'rule:'+rule['id'], rule)
                 for profile in profiles:
                     self._setting(c, 'profile:'+profile['id'], profile)
-                self._audit(c, {'action': 'import', 'batches': batches, 'after': rows})
+                self._audit(c, {'action': 'import', 'batches': batches, 'after': rows,'coverage_confirmed':coverage_confirmed})
         except Exception as e:
             # Never conceal connection/credential errors behind a duplicate message.
             if isinstance(e, sqlite3.IntegrityError) or getattr(e, 'sqlstate', None) == '23505':
                 raise ConflictError('이미 저장한 파일 또는 거래입니다. 전체 작업을 취소했습니다.') from e
             raise
 
-    def edit_rows(self, rows, rules=()):
+    def edit_rows(self, rows, rules=(), coverage_confirmed=False):
         validate_rows(rows)
         with self.connection(write=True) as c:
+            if self.pg:
+                self.execute(c, 'SELECT pg_advisory_xact_lock(716294018)')
+            current_rows=[json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_transactions').fetchall()]
+            self._check_coverage(c,rows,current_rows,coverage_confirmed)
             before = []
             for r in rows:
                 old = self.execute(c, 'SELECT payload FROM settlement_transactions WHERE id=?', (r['id'],)).fetchone()
@@ -122,6 +129,9 @@ class Store:
                 # Edits are classification only; identity, dates and amounts remain source-backed.
                 value = dict(previous)
                 value.update({k: r[k] for k in ['category','treatment','include','reviewed']})
+                value['card_account']=r.get('card_account','')
+                if 'duplicate_resolution' in r:
+                    value['duplicate_resolution']=r['duplicate_resolution']
                 value['version'] = r['version'] + 1
                 cursor = self.execute(c, 'UPDATE settlement_transactions SET payload=?,version=? WHERE id=? AND version=?',
                                       (json.dumps(value, ensure_ascii=False), value['version'], r['id'], r['version']))
@@ -130,11 +140,26 @@ class Store:
                 before.append(previous)
             for rule in rules:
                 self._setting(c, 'rule:'+rule['id'], rule)
-            self._audit(c, {'action': 'edit', 'before': before, 'after': rows})
+            self._audit(c, {'action': 'edit', 'before': before, 'after': rows,'coverage_confirmed':coverage_confirmed})
 
     def batch_ids(self):
         with self.connection() as c:
             return {r[0] for r in self.execute(c, 'SELECT id FROM settlement_batches').fetchall()}
+
+    def batches(self):
+        with self.connection() as c:
+            return [json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_batches').fetchall()]
+
+    def _check_coverage(self,c,rows,existing,confirmed):
+        settings=[(k,json.loads(p)) for k,p in self.execute(c,'SELECT id,payload FROM settlement_settings').fetchall()]
+        cards=[v for k,v in settings if k.startswith('card:')]
+        exemptions=[v for k,v in settings if k.startswith('no_billing:')]
+        checks=coverage_checks(rows,existing,cards,no_billing=exemptions)
+        if any(check['blocking'] for check in checks):
+            raise ValueError('카드 청구자료 누락 또는 카드대금 연결을 먼저 해결하세요.')
+        relevant=bool(checks) or any(r['source']=='카드' for r in rows)
+        if relevant and not confirmed:
+            raise ValueError('카드별 청구월·전체 건수·합계의 완전성을 확인하세요.')
 
     def export(self):
         # One consistent database snapshot, including import profiles, rules and edit history.

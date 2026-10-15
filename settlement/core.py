@@ -18,6 +18,14 @@ ALIASES = {
     'amount': ['이용금액', '승인금액', '거래금액', '금액'],
     'external_id': ['승인번호', '거래번호'],
 }
+CARD_ALIASES = {
+    'billing_month': ['청구월', '청구년월', '결제월', '결제예정일', '청구일자'],
+    'billing_amount': ['이번달청구금액', '당월청구금액', '청구금액', '청구원금'],
+    'purchase_total': ['총구매금액', '원거래금액', '전체승인금액'],
+    'installment_number': ['할부회차', '청구회차', '현재회차'],
+    'installment_total': ['할부개월수', '할부개월', '총회차'],
+    'fee': ['당월할부수수료', '할부수수료', '수수료'],
+}
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -26,9 +34,9 @@ def digest(value):
 def norm(value):
     return re.sub(r'\s+', '', str(value)).casefold()
 
-def guess_columns(columns):
+def guess_columns(columns, card=False):
     return {field: next((str(c) for a in aliases for c in columns if norm(c) == norm(a)), '')
-            for field, aliases in ALIASES.items()}
+            for field, aliases in (dict(ALIASES, **CARD_ALIASES) if card else ALIASES).items()}
 
 def guess_header(raw):
     scores = []
@@ -68,13 +76,53 @@ def transaction_date(value):
     s = s.replace('년', '-').replace('월', '-').replace('일', '')
     return pd.Timestamp(s).date().isoformat()
 
-def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount_mode):
+def billing_month(value):
+    if pd.isna(value) or not str(value).strip():
+        raise ValueError('청구월 누락')
+    if isinstance(value, (datetime, date, pd.Timestamp)):
+        return value.isoformat()[:7]
+    s = str(int(value)) if isinstance(value, (int,float)) and float(value).is_integer() else str(value).strip()
+    match = re.fullmatch(r'(\d{4})[-./년]?[ ]?(\d{1,2})월?', s)
+    if match:
+        return date(int(match[1]), int(match[2]), 1).isoformat()[:7]
+    return transaction_date(value)[:7]
+
+def installment_info(number, total):
+    def count(v):
+        if pd.isna(v) or str(v).strip() in ('', '-', '일시불', '0', '0.0'):
+            return None
+        s = str(v).strip()
+        if isinstance(v,(int,float)) and float(v).is_integer():
+            return int(v)
+        m = re.fullmatch(r'(\d+)\s*(?:회차|회|개월)?', s)
+        if not m:
+            raise ValueError('할부 회차/개월을 해석할 수 없습니다')
+        return int(m[1])
+    if isinstance(number,str) and '/' in number:
+        parts=number.split('/')
+        if len(parts)!=2:
+            raise ValueError('할부 회차 형식 오류')
+        n,t=count(parts[0]),count(parts[1])
+        explicit=count(total)
+        if explicit is not None and explicit!=t:
+            raise ValueError('할부 총회차가 서로 다릅니다')
+    else:
+        n,t=count(number),count(total)
+    if (n is not None and n<1) or (t is not None and t<1) or (n is not None and t is not None and n>t):
+        raise ValueError('할부 회차 범위를 확인하세요')
+    return n,t
+
+def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount_mode,
+               card_kind='승인내역', statement_month='', fee_included=True):
     if source not in ('은행', '카드') or not account.strip():
         raise ValueError('은행/카드 종류와 계좌·카드 별칭이 필요합니다')
-    required = ['date', 'description'] + (['amount'] if amount_mode != '입금/출금 별도' else [])
+    is_bill=source=='카드' and card_kind=='청구내역'
+    if source=='카드' and card_kind not in ('승인내역','청구내역'):
+        raise ValueError('카드 자료 종류를 확인하세요')
+    required = ['date', 'description'] + (['billing_amount'] if is_bill else (['amount'] if amount_mode != '입금/출금 별도' else []))
     if any(not mapping.get(k) for k in required):
         raise ValueError('거래일, 내역, 금액 열을 지정하세요')
-    if amount_mode == '입금/출금 별도' and not (mapping.get('inflow') or mapping.get('outflow')):
+    if not is_bill and amount_mode == '입금/출금 별도' and not (mapping.get('inflow') or mapping.get('outflow')):
         raise ValueError('입금 또는 출금 열이 필요합니다')
     selected = [v for v in mapping.values() if v]
     if len(selected) != len(set(selected)):
@@ -93,7 +141,12 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
             desc = '' if pd.isna(cell('description')) else str(cell('description')).strip()
             if not desc:
                 raise ValueError('내역 누락')
-            if amount_mode == '입금/출금 별도':
+            if is_bill:
+                charge=money(cell('billing_amount'))
+                fee=money(cell('fee'))
+                net_charge=charge if fee_included else charge+fee
+                incoming,outgoing=max(-net_charge,0),max(net_charge,0)
+            elif amount_mode == '입금/출금 별도':
                 incoming, outgoing = money(cell('inflow')), money(cell('outflow'))
                 if incoming < 0 or outgoing < 0:
                     raise ValueError('음수는 부호 있는 금액 방식으로 지정하세요')
@@ -105,7 +158,7 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
                     incoming, outgoing = max(amount, 0), max(-amount, 0)
             if incoming and outgoing:
                 raise ValueError('입금과 출금이 동시에 존재합니다')
-            if not incoming and not outgoing:
+            if not incoming and not outgoing and not is_bill:
                 raise ValueError('금액 0원: 합계/취소 행인지 확인하세요')
             ext = '' if pd.isna(cell('external_id')) else str(cell('external_id')).strip()
             row = dict(id=digest([batch_id, pos]), batch_id=batch_id, date=d,
@@ -113,11 +166,31 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
                        inflow=incoming, outflow=outgoing, external_id=ext, row_number=number,
                        category='미분류', treatment='사업', reviewed=False, include=True,
                        reason='분류 필요', duplicate=False, version=0)
-            row['fingerprint'] = digest([source, account.strip(), d, norm(desc), incoming, outgoing, ext])
+            if source=='카드':
+                n,t=installment_info(cell('installment_number'),cell('installment_total'))
+                row.update(purchase_date=d, card_kind=card_kind, installment_number=n,
+                           installment_total=t, purchase_total=money(cell('purchase_total')) if mapping.get('purchase_total') else None,
+                           settlement_basis='청구월' if is_bill else '승인내역(정산 제외)')
+                if is_bill:
+                    m=billing_month(cell('billing_month')) if mapping.get('billing_month') else billing_month(statement_month)
+                    if m < d[:7]:
+                        raise ValueError('청구월이 최초 구매월보다 빠릅니다')
+                    row.update(month=m,billing_month=m,billing_amount=charge,fee=fee,fee_included=fee_included)
+                    if net_charge==0:
+                        row.update(include=False,reason='당월 청구 0원: 정산 제외·내용 확인')
+                else:
+                    row.update(include=False,reason='승인내역: 월별 청구금액이 없어 정산 제외')
+            row['fingerprint'] = transaction_fingerprint(row)
             rows.append(row)
         except (ValueError, TypeError, OverflowError) as e:
             errors.append({'엑셀 행': number, '오류': str(e)})
     return rows, errors
+
+def transaction_fingerprint(row):
+    base=[row['source'],row['account'],row['date'],norm(row['description']),row['inflow'],row['outflow'],row.get('external_id','')]
+    if row.get('settlement_basis')=='청구월':
+        base += ['청구월',row['month'],row.get('installment_number'),row.get('installment_total')]
+    return digest(base)
 
 def rule_matches(rule, row):
     return (rule.get('enabled', True)
@@ -170,6 +243,10 @@ def classify(rows, rules, existing=(), advisor=None):
                     r.update(category=suggestion, reason='AI 제안: 확인 필요')
         if r['fingerprint'] in seen or counts[r['fingerprint']] > 1:
             r.update(duplicate=True, include=False, reviewed=False, reason='중복 후보: 동일 거래인지 확인')
+        if r.get('card_kind')=='승인내역':
+            r.update(include=False,reviewed=False,reason='승인내역: 월별 청구금액이 없어 정산 제외')
+        elif r.get('settlement_basis')=='청구월' and not r['inflow'] and not r['outflow']:
+            r.update(include=False,reviewed=False,reason='당월 청구 0원: 정산 제외·내용 확인')
         result.append(r)
     return result
 
@@ -186,7 +263,7 @@ def learn_rules(rows, amount_scoped=True):
     return list(rules.values())
 
 def metrics(rows):
-    business = [r for r in rows if r['include'] and r['treatment'] == '사업']
+    business = [r for r in rows if r['include'] and r['treatment'] == '사업' and r.get('card_kind')!='승인내역']
     income = sum(r['inflow'] for r in business if r['source'] == '은행')
     expense = sum(r['outflow'] - (r['inflow'] if r['source'] == '카드' else 0) for r in business)
     bank_net = sum(r['inflow'] - r['outflow'] for r in rows if r['include'] and r['source'] == '은행')
@@ -202,8 +279,17 @@ def validate_rows(rows):
     for r in rows:
         if r['treatment'] not in TREATMENTS or not str(r['category']).strip():
             raise ValueError('분류값 오류')
-        if transaction_date(r['date'])[:7] != r['month']:
+        expected_month=billing_month(r['billing_month']) if r.get('settlement_basis')=='청구월' else transaction_date(r['date'])[:7]
+        if expected_month != r['month']:
             raise ValueError('거래월 불일치')
+        if r.get('settlement_basis')=='청구월':
+            if r['source']!='카드' or r['month'] < transaction_date(r['date'])[:7]:
+                raise ValueError('카드 청구월 오류')
+            net=r['billing_amount']+(0 if r.get('fee_included',True) else r.get('fee',0))
+            if r['outflow']-r['inflow'] != net:
+                raise ValueError('청구금액과 집계금액 불일치')
+        if r['source']=='카드' and r.get('card_kind')=='승인내역' and r['include']:
+            raise ValueError('승인내역은 월정산에 포함할 수 없습니다. 월별 청구내역을 올리세요.')
         if not r['reviewed'] or (r['include'] and r['category'] == '미분류'):
             raise ValueError('확인 필요 거래를 모두 검토하세요. 제외 거래도 확인 체크가 필요합니다.')
         if r['source'] == '카드' and r['treatment'] == '카드대금 납부':

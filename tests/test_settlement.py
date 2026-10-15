@@ -11,7 +11,9 @@ from settlement.store import Store, ConflictError, restore_to_new_sqlite
 
 def sample(source='은행', description='상점', incoming=0, outgoing=100, file='file', account='사업'):
     frame = pd.DataFrame({'거래일':['2026-09-01'],'내역':[description],'입금액':[incoming],'출금액':[outgoing]})
-    rows, errors = parse_rows(frame,guess_columns(frame.columns),source,account,file,'내역',0,'입금/출금 별도')
+    if source=='카드':
+        frame=frame.drop(columns=['입금액','출금액']);frame['청구금액']=outgoing-incoming
+    rows, errors = parse_rows(frame,guess_columns(frame.columns,card=source=='카드'),source,account,file,'내역',0,'입금/출금 별도',card_kind='청구내역',statement_month='2026-09')
     assert not errors
     return rows[0]
 
@@ -31,8 +33,8 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(ValueError): transaction_date('09/01')
 
     def test_signed_refund(self):
-        frame=pd.DataFrame({'날짜':['2026-09-01'],'가맹점명':['상점'],'승인금액':['-1,000']})
-        rows, errors=parse_rows(frame,guess_columns(frame.columns),'카드','카드','f','s',0,'양수=출금 (음수=환불)')
+        frame=pd.DataFrame({'날짜':['2026-09-01'],'가맹점명':['상점'],'청구금액':['-1,000']})
+        rows, errors=parse_rows(frame,guess_columns(frame.columns,card=True),'카드','카드','f','s',0,'양수=출금 (음수=환불)',card_kind='청구내역',statement_month='2026-09')
         self.assertFalse(errors)
         rows[0].update(category='사입',reviewed=True)
         self.assertEqual(metrics(rows)['expense'],-1000)

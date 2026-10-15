@@ -1,7 +1,9 @@
-streamlit
-pandas
+streamlit>=1.55,<2
+pandas>=2.2,<3
 plotly
 openpyxl
 gspread
 google-auth
 matplotlib
+psycopg[binary]>=3.2,<4
+xlrd>=2.0,<3

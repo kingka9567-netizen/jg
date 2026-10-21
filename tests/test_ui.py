@@ -34,7 +34,7 @@ class UITests(unittest.TestCase):
             at.run()
             next(c for c in at.checkbox if '검토했습니다' in c.label).check().run()
             next(b for b in at.button if b.label=='현재 검색 결과 확인 처리 (분류 유지)').click().run()
-            next(c for c in at.checkbox if c.label=='카드별 청구월·전체 건수·합계를 확인했습니다').check().run()
+            next(c for c in at.checkbox if c.label=='카드별 사용월·전체 건수·합계를 확인했습니다').check().run()
             next(c for c in at.checkbox if c.label=='업로드 확인표의 파일별 기간·건수·금액을 원본과 대조했습니다').check().run()
             next(b for b in at.button if b.label=='검토한 정산 저장').click().run()
             self.assertFalse(at.exception)
@@ -42,6 +42,25 @@ class UITests(unittest.TestCase):
             next(r for r in at.radio if r.label=='작업').set_value('저장한 월정산').run()
             self.assertEqual(at.selectbox[0].value,'2026-09')
             self.assertFalse(at.exception)
+
+    def test_native_download_upload_keeps_usage_month_and_skips_mapping(self):
+        from test_originals import hyundai_file
+        with tempfile.TemporaryDirectory() as tmp:
+            f=io.BytesIO(hyundai_file());f.name='original.xls'
+            url='sqlite:///'+str(Path(tmp)/'native.sqlite3')
+            env={'SETTLEMENT_MODE':'local','SETTLEMENT_PASSWORD':'test-password-long-enough','SETTLEMENT_DATABASE_URL':url}
+            with patch.dict(os.environ,env),patch('streamlit.file_uploader',return_value=[f]):
+                at=AppTest.from_file(str(APP)).run()
+                at.session_state['authenticated']=True;at.run()
+                next(t for t in at.text_input if t.label=='정산 대상월').set_value('2026-09').run()
+                self.assertFalse(at.exception);self.assertFalse(at.error)
+                self.assertTrue(any('원본 형식 자동 인식' in s.value for s in at.success))
+                self.assertEqual(at.metric[1].value,'151,000원')
+                self.assertFalse(any(s.label=='자료 종류' for s in at.selectbox))
+                summary=next(d.value for d in at.dataframe if '정상 거래' in d.value.columns)
+                self.assertEqual(summary['정상 거래'].sum(),3)
+                self.assertEqual(summary['대상월 밖 제외'].sum(),1)
+                self.assertTrue(next(b for b in at.button if b.label=='검토한 정산 저장').disabled)
 
     def test_cloud_fail_closed_before_storage(self):
         with patch.dict(os.environ,{'SETTLEMENT_MODE':'cloud','SETTLEMENT_PASSWORD':''}):
@@ -128,7 +147,7 @@ class UITests(unittest.TestCase):
                 next(s for s in at.selectbox if s.label=='일괄 카테고리').set_value('사입').run()
                 next(c for c in at.checkbox if '검토했습니다' in c.label).check().run()
                 next(b for b in at.button if b.label=='현재 검색 결과에 적용').click().run()
-                next(c for c in at.checkbox if c.label=='카드별 청구월·전체 건수·합계를 확인했습니다').check().run()
+                next(c for c in at.checkbox if c.label=='카드별 사용월·전체 건수·합계를 확인했습니다').check().run()
                 next(c for c in at.checkbox if c.label=='업로드 확인표의 파일별 기간·건수·금액을 원본과 대조했습니다').check().run()
                 next(b for b in at.button if b.label=='검토한 정산 저장').click().run()
                 self.assertFalse(at.exception)

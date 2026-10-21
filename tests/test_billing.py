@@ -106,7 +106,7 @@ class CoverageTests(unittest.TestCase):
 
     def test_statement_already_stored_satisfies_presence(self):
         checks=coverage_checks([payment()],[bill()])
-        self.assertFalse(any(c['blocking'] for c in checks));self.assertEqual(checks[0]['status'],'청구자료 있음')
+        self.assertFalse(any(c['blocking'] for c in checks));self.assertEqual(checks[0]['status'],'카드자료 있음')
 
     def test_two_cards_same_bank_one_missing_is_detected(self):
         cards=[dict(account='신한 사업카드',bank_account='국민 사업통장'),dict(account='다른 사업카드',bank_account='국민 사업통장')]

@@ -18,10 +18,13 @@ def upload_summary(batches, rows):
             '처리 상태':batch.get('status','검토 대상'),
             '원본 데이터 행':batch.get('source_rows',len(items)), '정상 거래':len(items),
             '빈 행':batch.get('blank_rows',0),'오류 행':batch.get('error_count',0),
+            '소계/합계 제외':batch.get('ignored_rows',0),
             '구매/거래 기간':f'{dates[0]} ~ {dates[-1]}' if dates else '없음',
             '정산월':', '.join(sorted({r['month'] for r in items})),
             '입금/환불 합계':sum(r['inflow'] for r in items),
             '출금/당월 청구 합계':sum(r['outflow'] for r in items),
+            '정산 포함 지출':sum(r['outflow']-r['inflow'] for r in items if r['include'] and r['treatment']=='사업'),
+            '대상월 밖 제외':sum(bool(r.get('outside_period')) for r in items),
             '중복 후보':sum(bool(r.get('duplicate')) for r in items),
             '최장 거래 없는 일수':max(gaps,default=0),
         })
@@ -35,14 +38,17 @@ def coverage_checks(rows, existing=(), cards=(), months=(), no_billing=()):
     months=set(months) or {r['month'] for r in rows}
     exempt={(e['month'],e['account']) for e in no_billing if e.get('confirmed') and e.get('reason','').strip()}
     active=[c for c in cards if c.get('enabled',True)]
-    evidence={(r['month'],r['account']) for r in all_rows if r['source']=='카드' and r.get('settlement_basis')=='청구월'}
+    evidence={(r['month'],r['account']) for r in all_rows if r['source']=='카드' and r.get('settlement_basis') in ('청구월','사용월')}
     checks=[]
     def add(month,account,status,message,blocking=False):
         checks.append(dict(month=month,account=account,status=status,message=message,blocking=blocking))
-    mixed={(r['month'],r['account']) for r in all_rows if r['source']=='카드' and r['include']
-           and r.get('settlement_basis')!='청구월' and r['month'] in months and (r['month'],r['account']) in evidence}
+    bases=defaultdict(set)
+    for r in all_rows:
+        if r['source']=='카드' and r['include'] and r['month'] in months:
+            bases[(r['month'],r['account'])].add(r.get('settlement_basis','구버전'))
+    mixed={key for key,values in bases.items() if len(values)>1}
     for month,account in sorted(mixed):
-        add(month,account,'구버전 자료 중복 위험','같은 카드·월에 거래일 기준 자료와 청구월 기준 자료가 함께 있습니다. 이전 자료를 검토해 제외한 후 저장하세요.',True)
+        add(month,account,'구버전 자료 중복 위험','같은 카드·월에 서로 다른 정산 기준의 자료가 섞였습니다. 기존 자료를 검토해 제외한 후 저장하세요.',True)
     needed={(month,c['account']) for month in months for c in active
             if not c.get('start_month') or month>=c['start_month']}
     for r in all_rows:
@@ -58,7 +64,7 @@ def coverage_checks(rows, existing=(), cards=(), months=(), no_billing=()):
             needed.add((r['month'],account))
     for month,account in sorted(needed):
         if (month,account) in evidence:
-            add(month,account,'청구자료 있음','청구내역을 찾았습니다. 파일 전체 행·합계와 청구기간의 완전성은 별도 확인이 필요합니다.')
+            add(month,account,'카드자료 있음','해당 정산월 카드 자료를 찾았습니다. 전체 사용기간·건수·합계의 완전성은 별도 확인이 필요합니다.')
         elif (month,account) in exempt:
             add(month,account,'청구 없음 확인','사용자가 사유와 함께 이번 달 청구 없음으로 확인했습니다.')
         else:

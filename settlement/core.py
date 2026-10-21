@@ -21,6 +21,7 @@ ALIASES = {
 CARD_ALIASES = {
     'billing_month': ['청구월', '청구년월', '결제월', '결제예정일', '청구일자'],
     'billing_amount': ['이번달청구금액', '당월청구금액', '청구금액', '청구원금'],
+    'purchase_amount': ['이용금액', '승인금액', '거래금액'],
     'purchase_total': ['총구매금액', '원거래금액', '전체승인금액'],
     'installment_number': ['할부회차', '청구회차', '현재회차'],
     'installment_total': ['할부개월수', '할부개월', '총회차'],
@@ -168,7 +169,7 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
                        reason='분류 필요', duplicate=False, version=0)
             if source=='카드':
                 n,t=installment_info(cell('installment_number'),cell('installment_total'))
-                row.update(purchase_date=d, card_kind=card_kind, installment_number=n,
+                row.update(purchase_date=d, purchase_amount=money(cell('purchase_amount')) if mapping.get('purchase_amount') else None, card_kind=card_kind, installment_number=n,
                            installment_total=t, purchase_total=money(cell('purchase_total')) if mapping.get('purchase_total') else None,
                            settlement_basis='청구월' if is_bill else '승인내역(정산 제외)')
                 if is_bill:
@@ -190,7 +191,49 @@ def transaction_fingerprint(row):
     base=[row['source'],row['account'],row['date'],norm(row['description']),row['inflow'],row['outflow'],row.get('external_id','')]
     if row.get('settlement_basis')=='청구월':
         base += ['청구월',row['month'],row.get('installment_number'),row.get('installment_total')]
+    elif row.get('settlement_basis')=='사용월' and row.get('installment_total',0) and row['installment_total']>1:
+        base += ['할부',row['month'],row.get('installment_number'),row.get('installment_total')]
     return digest(base)
+
+def use_in_month(original, month):
+    """Assign a statement's installment round to the chosen operating month.
+
+    One-time purchases use their actual usage month, independently of when due.
+    Never use a zero revolving payment to erase actual card usage.
+    """
+    row=dict(original)
+    if row['source']!='카드':
+        return row
+    month=billing_month(month)
+    total=row.get('installment_total') or 0
+    installment=total>1 or (row.get('installment_number') or 0)>1
+    if installment:
+        if row.get('billing_amount') is None:
+            raise ValueError('할부는 해당 회차의 원금이 필요합니다. 전체 구매금액을 자동 분할하지 않습니다.')
+        net=money(row['billing_amount'])+(0 if row.get('fee_included',True) else money(row.get('fee',0)))
+        expense_basis='할부 회차 원금·수수료'
+    else:
+        amount=row.get('purchase_amount')
+        if amount is None:
+            amount=row.get('purchase_total')
+        if amount is None and row.get('card_kind')=='청구내역':
+            raise ValueError('일시불 실제 사용금액 열이 필요합니다. 납부 원금을 사용액으로 추정하지 않습니다.')
+        if amount is None:
+            amount=row['outflow']-row['inflow']
+        net=money(amount)+money(row.get('discount_amount',0))
+        expense_basis='일시불 사용금액'
+    outside=not installment and row['date'][:7]!=month
+    if installment and row['date'][:7]>month:
+        raise ValueError('할부 정산월이 최초 구매월보다 빠릅니다.')
+    row.update(month=month,settlement_month=month,settlement_basis='사용월',
+               usage_month=month if installment else row['date'][:7],card_kind='사용내역',
+               recognized_amount=net,expense_basis=expense_basis,outside_period=outside,
+               outflow=max(net,0),inflow=max(-net,0),include=not outside,
+               reviewed=False,reason='대상월 밖의 일시불 사용: 제외' if outside else '사용월 기준 분류 필요')
+    if net==0:
+        row.update(include=False,reason='당월 반영액 0원: 확인 필요')
+    row['fingerprint']=transaction_fingerprint(row)
+    return row
 
 def rule_matches(rule, row):
     return (rule.get('enabled', True)
@@ -247,6 +290,8 @@ def classify(rows, rules, existing=(), advisor=None):
             r.update(include=False,reviewed=False,reason='승인내역: 월별 청구금액이 없어 정산 제외')
         elif r.get('settlement_basis')=='청구월' and not r['inflow'] and not r['outflow']:
             r.update(include=False,reviewed=False,reason='당월 청구 0원: 정산 제외·내용 확인')
+        if r.get('outside_period'):
+            r.update(include=False,reviewed=False,reason='대상월 밖의 사용: 제외·기간 확인')
         result.append(r)
     return result
 
@@ -279,7 +324,9 @@ def validate_rows(rows):
     for r in rows:
         if r['treatment'] not in TREATMENTS or not str(r['category']).strip():
             raise ValueError('분류값 오류')
-        expected_month=billing_month(r['billing_month']) if r.get('settlement_basis')=='청구월' else transaction_date(r['date'])[:7]
+        basis=r.get('settlement_basis')
+        expected_month=(billing_month(r['billing_month']) if basis=='청구월' else
+                        billing_month(r['settlement_month']) if basis=='사용월' else transaction_date(r['date'])[:7])
         if expected_month != r['month']:
             raise ValueError('거래월 불일치')
         if r.get('settlement_basis')=='청구월':
@@ -288,6 +335,11 @@ def validate_rows(rows):
             net=r['billing_amount']+(0 if r.get('fee_included',True) else r.get('fee',0))
             if r['outflow']-r['inflow'] != net:
                 raise ValueError('청구금액과 집계금액 불일치')
+        if basis=='사용월':
+            if r['source']!='카드' or r['outflow']-r['inflow']!=r['recognized_amount']:
+                raise ValueError('사용월 집계금액 불일치')
+            if r.get('outside_period') and r['include']:
+                raise ValueError('대상월 밖의 일시불 사용은 포함할 수 없습니다.')
         if r['source']=='카드' and r.get('card_kind')=='승인내역' and r['include']:
             raise ValueError('승인내역은 월정산에 포함할 수 없습니다. 월별 청구내역을 올리세요.')
         if not r['reviewed'] or (r['include'] and r['category'] == '미분류'):

@@ -11,7 +11,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from settlement.core import (CATEGORIES, TREATMENTS, ALIASES, CARD_ALIASES, digest, guess_columns,
-    guess_header, parse_rows, classify, learn_rules, metrics, csv_safe, billing_month)
+    guess_header, parse_rows, classify, learn_rules, metrics, csv_safe, billing_month, use_in_month)
+from settlement.originals import read_original
 from settlement.checks import upload_summary, coverage_checks, duplicate_comparisons
 from settlement.store import Store, ConflictError
 
@@ -89,7 +90,7 @@ with st.sidebar:
             card_name=st.text_input('카드 별칭 (파일 설정과 동일)')
             bank_name=st.text_input('카드대금 출금 통장 별칭')
             card_start=st.text_input('점검 시작월',value=(pd.Timestamp.now(tz='Asia/Seoul')-pd.DateOffset(months=1)).strftime('%Y-%m'))
-            card_enabled=st.checkbox('매월 청구자료 점검',value=True)
+            card_enabled=st.checkbox('매월 카드자료 점검',value=True)
             if st.form_submit_button('카드 설정 저장'):
                 try:
                     if not card_name.strip() or not bank_name.strip():
@@ -117,7 +118,7 @@ def show_metrics(rows, target):
         cols[2].metric('최종 순수익 (월정산 기준)', f"{m['residual']:,}원")
         cols[3].metric('확인 필요', f"{m['pending']}건")
         st.caption('최종 순수익은 수수료 차감 후 사업 입금 − 사업 지출입니다. 재고·미수금·감가상각 등을 반영하는 회계상 순이익과 다릅니다. 세금 예비비를 자동 차감하지 않습니다.')
-        st.caption(f"은행 순현금 증감: {m['bank_net']:,}원 · 포함된 은행 거래의 모든 입출금(이체·대출·카드대금 포함) 기준. 새 카드 자료는 구매일과 별도로 청구월의 실제 청구액을 집계합니다. 월정산 잔여금과 통장 잔액은 다를 수 있습니다.")
+        st.caption(f"은행 순현금 증감: {m['bank_net']:,}원 · 포함된 은행 거래의 모든 입출금(이체·대출·카드대금 포함) 기준. 카드 일시불은 선택한 월의 사용액, 할부는 업로드한 명세서의 해당 회차 금액을 집계합니다. 납부 예정월은 참고 정보입니다. 월정산 잔여금과 통장 잔액은 다를 수 있습니다.")
         if m['pending']:
             st.warning('검토 전 예상 합계입니다. 미확인 사업 거래도 포함하며, 중복 후보는 기본 제외합니다.')
 
@@ -126,13 +127,13 @@ def card_review(rows,key,months=()):
     has_card=bool(checks) or any(r['source']=='카드' for r in rows)
     if not has_card:
         return True
-    st.subheader('카드 청구자료 누락 점검')
+    st.subheader('카드 사용자료 누락 점검')
     if checks:
-        table=pd.DataFrame(checks).rename(columns={'month':'청구월','account':'카드','status':'상태','message':'확인 내용'})
+        table=pd.DataFrame(checks).rename(columns={'month':'정산월','account':'카드','status':'상태','message':'확인 내용'})
         st.dataframe(table.drop(columns='blocking'),hide_index=True,width='stretch')
     missing=[c for c in checks if c['blocking']]
     if missing:
-        st.error('누락 또는 미연결 카드가 있습니다. 카드 청구내역 업로드, 대상 카드 연결, 청구 없음 확인 중 필요한 조치를 완료하세요.')
+        st.error('누락 또는 미연결 카드가 있습니다. 카드 사용자료 업로드, 대상 카드 연결, 해당월 내역 없음 확인 중 필요한 조치를 완료하세요.')
         absent=[c for c in missing if c['status']=='청구자료 누락']
         if absent:
             with st.expander('실제 청구가 없는 달 기록'):
@@ -143,10 +144,10 @@ def card_review(rows,key,months=()):
                     item=absent[selected]
                     store.save_setting('no_billing:'+digest([item['month'],item['account']]),dict(month=item['month'],account=item['account'],reason=reason.strip(),confirmed=True))
                     st.rerun()
-    if any(r['source']=='카드' and r.get('settlement_basis')!='청구월' for r in rows):
-        st.warning('승인내역 또는 이전 버전의 거래일 기준 카드 자료가 있습니다. 기존 자료는 자동 변환하지 않습니다. 새 승인내역은 정산에 포함할 수 없습니다.')
-    complete=st.checkbox('카드별 청구월·전체 건수·합계를 확인했습니다',key=key+'_card_complete')
-    st.caption('청구자료 있음은 파일의 존재 확인입니다. 완전성이나 은행 납부액과의 대사 완료를 뜻하지 않습니다. 등록하지 않은 카드도 직접 확인하세요.')
+    if any(r['source']=='카드' and r.get('settlement_basis') not in ('청구월','사용월') for r in rows):
+        st.warning('승인내역 또는 이전 버전의 거래일 기준 카드 자료가 있습니다. 기존 자료는 자동 변환하지 않습니다. 이 자료를 새 사용월 기준으로 자동 변환하지 않습니다.')
+    complete=st.checkbox('카드별 사용월·전체 건수·합계를 확인했습니다',key=key+'_card_complete')
+    st.caption('카드자료 있음은 파일의 존재 확인입니다. 명세서 마감 이후의 월말 사용내역이 빠지지 않았는지도 확인하세요. 완전성이나 은행 납부액과의 대사 완료를 뜻하지 않습니다. 등록하지 않은 카드도 직접 확인하세요.')
     return complete and not missing
 
 def compare_duplicates(draft,key,batches=()):
@@ -247,11 +248,11 @@ def editor(rows, key, batches=()):
     else:
         st.info('현재 조건에 해당하는 거래가 없습니다. 전체 내역은 확인 필요 필터를 해제하세요.')
     compare_duplicates(draft,key,batches)
-    installments=[r for r in draft if r['source']=='카드' and r.get('settlement_basis')=='청구월']
+    installments=[r for r in draft if r['source']=='카드' and r.get('settlement_basis') in ('청구월','사용월')]
     if installments:
-        with st.expander('카드 구매일·청구월·할부 정보'):
-            st.dataframe(pd.DataFrame([{'구매일':r['date'],'청구월':r['month'],'카드':r['account'],'내역':r['description'],
-                '전체 구매금액(참고)':r.get('purchase_total'),'당월 청구금액':r.get('billing_amount'),'수수료':r.get('fee',0),
+        with st.expander('카드 사용일·정산월·할부 정보'):
+            st.dataframe(pd.DataFrame([{'구매일':r['date'],'정산월':r['month'],'납부명세서월(참고)':r.get('billing_month','미표시'),'반영기준':r.get('expense_basis',r.get('settlement_basis')),'카드':r['account'],'내역':r['description'],
+                '사용금액(참고)':r.get('purchase_amount'),'전체 구매금액(참고)':r.get('purchase_total'),'당월 청구금액':r.get('billing_amount'),'수수료':r.get('fee',0),
                 '수수료 포함':r.get('fee_included',True),'이번 회차':r.get('installment_number'),'총 회차':r.get('installment_total'),
                 '집계 지출':r['outflow']-r['inflow']} for r in installments]),hide_index=True,width='stretch')
     show_metrics([r for r in draft if r['month']==metric_month], slot)
@@ -294,7 +295,9 @@ if view == '새 파일 정산':
             for src,account,f in [('은행','사업통장',frame),('카드','사업카드',card)]:
                 mapping=guess_columns(f.columns,card=src=='카드')
                 rs,errors=parse_rows(f,mapping,src,account,digest([src,installment]),'예시',0,'입금/출금 별도',
-                                    card_kind='청구내역',statement_month='2026-09',fee_included=False)
+                                    card_kind='청구내역',statement_month='2026-10',fee_included=False)
+                if src=='카드':
+                    rs=[use_in_month(r,'2026-09') for r in rs]
                 for row in rs:
                     if row['treatment']=='카드대금 납부' or row['description']=='카드대금':
                         row['card_account']='사업카드'
@@ -307,13 +310,52 @@ if view == '새 파일 정산':
         parsed_for_summary=staged_rows
     else:
         files=st.file_uploader('은행·카드 엑셀 파일',type=['xlsx','xls','csv'],accept_multiple_files=True)
-        known_profiles=store.settings('profile:')
+        all_profiles=store.settings('profile:')
+        known_profiles=[p for p in all_profiles if not p.get('native')]
         saved_batch_ids=store.batch_ids()
-        st.caption('계좌/카드 별칭을 매달 동일하게 사용하세요. 카드 청구내역은 당월 청구금액으로 집계하며 승인내역은 정산에서 제외합니다.')
+        st.caption('정산 대상월의 은행 입출금과 카드 사용액을 집계합니다. 10월 납부 명세서라도 9월 일시불 사용은 9월에 반영합니다. 할부는 업로드한 명세서의 회차 금액을 반영하므로 대상 회차를 확인하세요.')
         for index,file in enumerate(files or []):
             data=file.getvalue();file_hash=hashlib.sha256(data).hexdigest()
             key=f'upload_{index}_{file_hash[:12]}'
             with st.expander(file.name,expanded=True):
+                try:
+                    native=read_original(data,file.name,target_month)
+                except Exception as error:
+                    st.error(f'원본 파일을 읽을 수 없습니다: {error}')
+                    problems.append({'파일':file.name,'오류':str(error)})
+                    continue
+                if native is not None:
+                    prior=next((p for p in all_profiles if p.get('native') and p.get('format')==native['format']),None)
+                    alias=st.text_input('계좌/카드 별칭',value=prior['account'] if prior else native['alias'],key=key+'_native_alias').strip()
+                    if not alias:
+                        problems.append({'파일':file.name,'오류':'계좌/카드 별칭 필요'})
+                        st.error('계좌/카드 별칭을 입력하세요.')
+                        continue
+                    if alias!=native['alias']:
+                        native=read_original(data,file.name,target_month,alias)
+                    st.success('원본 형식 자동 인식: '+native['format'])
+                    for note in native['notes']:
+                        st.caption(note)
+                    if native['controls']:
+                        st.dataframe(pd.DataFrame(native['controls']),hide_index=True)
+                    if native['errors']:
+                        problems.extend(native['errors'])
+                        st.error('원본 검증 오류가 있어 저장을 차단합니다.')
+                        st.dataframe(pd.DataFrame(native['errors']),hide_index=True)
+                    parsed_for_summary.extend(native['rows'])
+                    for meta in native['batches']:
+                        bid=meta['id']
+                        if bid in saved_batch_ids:
+                            meta['status']='이미 저장한 파일'
+                            st.warning('이미 저장한 파일·시트입니다. 이번 저장에서 제외합니다.')
+                        elif bid not in {b['id'] for b in batches}:
+                            batches.append(meta)
+                            staged_rows.extend(r for r in native['rows'] if r['batch_id']==bid)
+                        else:
+                            meta['status']='이번 업로드 중복 파일'
+                        file_checks.append(meta)
+                    profiles.append(dict(id=digest(['native',native['format']]),native=True,format=native['format'],account=alias,source=native['source']))
+                    continue
                 src=st.selectbox('자료 종류',['은행','카드'],key=key+'_source')
                 accounts=sorted({p['account'] for p in known_profiles if p['source']==src} | ({c['account'] for c in registered_cards} if src=='카드' else set()))
                 choice=st.selectbox('저장한 계좌/카드',accounts+['새로 등록'],key=key+'_account_choice')
@@ -353,9 +395,9 @@ if view == '새 파일 정산':
                         if card_kind=='청구내역':
                             month=st.text_input('파일 청구월 (청구월 열이 없을 때)',value=target_month,key=key+'_billmonth')
                             fee_included=st.checkbox('청구금액에 당월 수수료가 이미 포함됨',value=saved.get('fee_included',True) if saved else True,key=key+'_fee_included')
-                            st.caption('구매일은 7월이어도 청구월이 9월이면 9월 지출입니다. 전체 구매금액을 할부개월로 자동 나누지 않습니다.')
+                            st.caption('일시불은 실제 사용월로 집계합니다. 할부는 이 명세서의 회차 원금과 수수료를 선택한 정산월에 반영합니다.')
                         else:
-                            st.warning('승인내역에는 당월 청구액이 없습니다. 참고용으로만 저장하며 월정산에 포함할 수 없습니다.')
+                            st.warning('일시불 승인내역은 실제 사용월에 반영합니다. 할부는 회차별 원금이 있는 명세서가 필요합니다.')
                     is_bill=src=='카드' and card_kind=='청구내역'
                     modes=['입금/출금 별도','양수=출금 (음수=환불)','양수=입금 (음수=출금)']
                     if is_bill:
@@ -366,7 +408,7 @@ if view == '새 파일 정산':
                     mapping={}
                     labels={'date':'최초 구매일 / 은행 거래일','description':'내역/거래처','outflow':'출금','inflow':'입금','amount':'부호 있는 금액',
                             'external_id':'승인/거래번호 (선택)','billing_month':'청구월 열 (없으면 파일 청구월 사용)',
-                            'billing_amount':'이번 달 청구금액 (환불은 음수)','purchase_total':'전체 구매금액 (참고용·선택)',
+                            'billing_amount':'이번 달 청구금액 (환불은 음수)','purchase_amount':'일시불 실제 사용금액 (리볼빙 원금과 구분)','purchase_total':'전체 구매금액 (참고용·선택)',
                             'installment_number':'이번 할부 회차 또는 3/3 (선택)','installment_total':'전체 할부 개월/회차 (선택)',
                             'fee':'이번 달 할부 수수료 (선택)'}
                     fields=list(ALIASES)+list(CARD_ALIASES) if src=='카드' else list(ALIASES)
@@ -387,6 +429,8 @@ if view == '새 파일 정산':
                     st.caption('저장한 형식 적용' if saved else '처음 보는 형식 · 정상 저장 시 기억합니다')
                     st.dataframe(frame.head(5),hide_index=True)
                     parsed,errors=parse_rows(frame,mapping,src,account,file_hash,sheet,header,amount_mode,card_kind=card_kind or '승인내역',statement_month=month,fee_included=fee_included)
+                    if src=='카드':
+                        parsed=[use_in_month(r,target_month) for r in parsed]
                     bid=digest([file_hash,src,account.strip(),sheet])
                     meta.update(id=bid,source_rows=len(frame),error_count=len(errors),blank_rows=len(frame)-len(parsed)-len(errors),card_kind=card_kind or '은행 거래')
                     parsed_for_summary.extend(parsed)
@@ -416,7 +460,7 @@ if view == '새 파일 정산':
         overrides={r['id']:r for r in staged_rows}
         summary_rows=[overrides.get(r['id'],r) for r in parsed_for_summary]
         st.dataframe(pd.DataFrame(upload_summary(file_checks,summary_rows)),hide_index=True,width='stretch')
-        st.caption('원본 데이터 행 = 정상 거래 + 빈 행 + 오류 행. 거래 없는 날짜가 곧 누락을 뜻하지는 않습니다. 원본 파일 전체 건수·합계와 대조하세요.')
+        st.caption('원본 데이터 행 = 정상 거래 + 빈 행 + 소계/합계 제외 + 오류 행. 거래 없는 날짜가 곧 누락을 뜻하지는 않습니다. 원본 파일 전체 건수·합계와 대조하세요.')
         other_months=sorted({r['month'] for r in summary_rows if r['month']!=target_month})
         if other_months:
             st.warning('정산 대상월 밖의 거래가 있습니다: '+', '.join(other_months)+' · 의도한 기간인지 확인하세요.')

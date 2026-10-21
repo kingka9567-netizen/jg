@@ -1,4 +1,6 @@
 import os
+import json
+import streamlit as st
 import io
 import tempfile
 import hashlib
@@ -61,6 +63,29 @@ class UITests(unittest.TestCase):
                 self.assertEqual(summary['정상 거래'].sum(),3)
                 self.assertEqual(summary['대상월 밖 제외'].sum(),1)
                 self.assertTrue(next(b for b in at.button if b.label=='검토한 정산 저장').disabled)
+
+    def test_local_preview_loads_supplied_original_without_upload(self):
+        from test_originals import hyundai_file
+        original_get_option=st.get_option
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'original.xls';p.write_bytes(hyundai_file())
+            env={'SETTLEMENT_MODE':'demo','SETTLEMENT_PREVIEW_FILES':json.dumps([str(p)]),'SETTLEMENT_PREVIEW_MONTH':'2026-09'}
+            with patch.dict(os.environ,env),patch('streamlit.get_option',side_effect=lambda key: '127.0.0.1' if key=='server.address' else original_get_option(key)):
+                at=AppTest.from_file(str(APP)).run()
+                self.assertFalse(at.exception);self.assertFalse(at.error)
+                self.assertEqual(at.metric[1].value,'151,000원')
+                self.assertFalse(any('가상' in b.label for b in at.button))
+                self.assertTrue(any('실제 자료 로컬 검토' in i.value for i in at.info))
+                self.assertEqual(p.read_bytes(),hyundai_file())
+
+    def test_private_preview_refuses_public_bind(self):
+        original_get_option=st.get_option
+        env={'SETTLEMENT_MODE':'demo','SETTLEMENT_PREVIEW_FILES':'["never-read.xls"]'}
+        with patch.dict(os.environ,env),patch('streamlit.get_option',side_effect=lambda key: '0.0.0.0' if key=='server.address' else original_get_option(key)):
+            at=AppTest.from_file(str(APP)).run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any('로컬 주소에만' in e.value for e in at.error))
+            self.assertFalse(at.metric)
 
     def test_cloud_fail_closed_before_storage(self):
         with patch.dict(os.environ,{'SETTLEMENT_MODE':'cloud','SETTLEMENT_PASSWORD':''}):

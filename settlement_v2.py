@@ -29,6 +29,9 @@ def config(key, default=''):
 MODE = config('SETTLEMENT_MODE', 'demo')
 if MODE not in ('demo', 'local', 'cloud'):
     st.error('SETTLEMENT_MODE는 demo, local, cloud 중 하나여야 합니다.'); st.stop()
+PREVIEW_PATHS = json.loads(os.environ.get('SETTLEMENT_PREVIEW_FILES','[]'))
+if PREVIEW_PATHS and (MODE!='demo' or st.get_option('server.address') not in ('127.0.0.1','localhost','::1')):
+    st.error('실제 자료 미리보기는 로컬 주소에만 열 수 있습니다.'); st.stop()
 if MODE != 'demo':
     password = config('SETTLEMENT_PASSWORD')
     if len(password) < 16:
@@ -72,7 +75,10 @@ with st.sidebar:
     st.title('📒 월정산')
     menu = st.radio('대메뉴', ['월별 정산 내역', '월별 사업 분석 보고서'])
     if MODE == 'demo':
-        st.warning('체험 모드 · 가상 자료\n실제 자료는 운영 모드에서 업로드하세요.')
+        if PREVIEW_PATHS:
+            st.info('실제 자료 로컬 검토 · 원본은 읽기만 합니다. 기존 운영 자료와 분리된 임시 검토 공간입니다.')
+        else:
+            st.warning('체험 모드 · 가상 자료\n실제 자료는 운영 모드에서 업로드하세요.')
     else:
         st.caption('운영 모드 · '+ ('PostgreSQL' if store.pg else '로컬 SQLite'))
         if st.button('로그아웃'):
@@ -274,12 +280,12 @@ def rule_options(key):
 if view == '새 파일 정산':
     staged_rows, batches, profiles, problems, file_checks, parsed_for_summary = [], [], [], [], [], []
     last_month=(pd.Timestamp.now(tz='Asia/Seoul')-pd.DateOffset(months=1)).strftime('%Y-%m')
-    target_input=st.text_input('정산 대상월',value=last_month)
+    target_input=st.text_input('정산 대상월',value=os.environ.get('SETTLEMENT_PREVIEW_MONTH',last_month))
     try:
         target_month=billing_month(target_input)
     except ValueError:
         st.error('정산 대상월은 YYYY-MM 형식으로 입력하세요.');st.stop()
-    if MODE == 'demo':
+    if MODE == 'demo' and not PREVIEW_PATHS:
         st.info('기본 가상 자료 또는 7월 구매·9월 3/3회차 청구 예시를 불러올 수 있습니다.')
         basic=st.button('가상 은행·카드 내역 불러오기')
         installment=st.button('7월 구매·9월 할부 청구 예시 불러오기')
@@ -309,7 +315,18 @@ if view == '새 파일 정산':
         file_checks=batches
         parsed_for_summary=staged_rows
     else:
-        files=st.file_uploader('은행·카드 엑셀 파일',type=['xlsx','xls','csv'],accept_multiple_files=True)
+        if PREVIEW_PATHS:
+            st.info('보내주신 은행·현대카드·삼성카드 원본을 불러왔습니다. 9월 사용분과 분류를 검토하세요. 분류를 확인하기 전 합계는 확정 금액이 아닙니다.')
+            files=[]
+            for path in PREVIEW_PATHS:
+                try:
+                    supplied=Path(path)
+                    file=io.BytesIO(supplied.read_bytes());file.name=supplied.name
+                    files.append(file)
+                except OSError:
+                    st.error('검토할 원본 파일을 읽지 못했습니다.'); st.stop()
+        else:
+            files=st.file_uploader('은행·카드 엑셀 파일',type=['xlsx','xls','csv'],accept_multiple_files=True)
         all_profiles=store.settings('profile:')
         known_profiles=[p for p in all_profiles if not p.get('native')]
         saved_batch_ids=store.batch_ids()
@@ -317,7 +334,7 @@ if view == '새 파일 정산':
         for index,file in enumerate(files or []):
             data=file.getvalue();file_hash=hashlib.sha256(data).hexdigest()
             key=f'upload_{index}_{file_hash[:12]}'
-            with st.expander(file.name,expanded=True):
+            with st.expander(file.name,expanded=not bool(PREVIEW_PATHS)):
                 try:
                     native=read_original(data,file.name,target_month)
                 except Exception as error:

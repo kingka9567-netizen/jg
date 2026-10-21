@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, date, timedelta
 import pandas as pd
+from .classification import suggest, needs_purpose
 
 CATEGORIES = ['미분류', '판매대금 입금', '사입', '부자재', '세금', '택배비', '광고비',
               '식비', '구독/통신', '생활 및 기타', '기타']
@@ -243,8 +244,11 @@ def rule_matches(rule, row):
                  else norm(rule['description']) in norm(row['description']))
             and (rule.get('amount') is None or rule['amount'] == (row['outflow'] or row['inflow'])))
 
-def classify(rows, rules, existing=(), advisor=None):
+def classify(rows, rules, existing=(), advisor=None, legacy_mapping=(), legacy_excluded=()):
     """advisor is an optional local callable returning suggestions; never confirms a row."""
+    legacy=defaultdict(set)
+    for item in legacy_mapping:
+        legacy[norm(item['description'])].add(item['category'])
     seen = {r['fingerprint'] for r in existing}
     counts = Counter(r['fingerprint'] for r in rows)
     exact, partial = defaultdict(list), []
@@ -263,23 +267,28 @@ def classify(rows, rules, existing=(), advisor=None):
         if len(decisions) == 1:
             r['category'], r['treatment'] = next(iter(decisions))
             r.update(reviewed=True, reason='확인한 분류 규칙')
-            if any(p in norm(r['description']) for p in ['네이버페이','naverpay','카카오페이','토스페이']):
+            if any(p in norm(r['description']) for p in ['네이버페이','네이버파이낸셜','naverpay','카카오페이','토스페이','kcp','이니시스']):
                 r.update(reviewed=False, reason='공용 결제명: 같은 금액도 용도가 다를 수 있어 확인 필요')
         elif len(decisions) > 1:
             r.update(reason='분류 규칙 충돌: 확인 필요')
         else:
-            text = norm(r['description'])
-            for words, cat, treatment in [
-                (['카드대금', '카드결제대금'], '기타', '카드대금 납부'),
-                (['대출', '차입'], '기타', '대출'),
-                (['계좌이체', '자금이체'], '기타', '계좌이체'),
-                (['cj대한통운', '롯데택배', '한진택배'], '택배비', '사업'),
-                (['메타광고', 'facebookads', 'googleads'], '광고비', '사업'),
-                (['스마트스토어정산', '쿠팡정산'], '판매대금 입금', '사업'),
-            ]:
-                if any(w in text for w in words):
-                    r.update(category=cat, treatment=treatment, reason='거래명 추천: 첫 확인 필요')
-                    break
+            legacy_hits=legacy[norm(r['description'])]
+            suggestion=suggest(r)
+            if len(legacy_hits)==1:
+                category=next(iter(legacy_hits))
+                treatment='개인/제외' if category in legacy_excluded else '사업'
+                if suggestion and suggestion[1] in ('카드대금 납부','계좌이체','대출'):
+                    treatment=suggestion[1]
+                r.update(category=category,treatment=treatment,reason='기존 분류표 추천: 첫 적용 확인 필요')
+                r['purpose_ambiguous']=any(p in norm(r['description']) for p in ('네이버페이','네이버파이낸셜','카카오페이','토스페이','kcp','이니시스'))
+                if r['purpose_ambiguous']:
+                    r['reason']='기존 분류표 추천·공용 결제명: 용도 확인 필요'
+            elif len(legacy_hits)>1:
+                r.update(reason='기존 분류표 충돌: 확인 필요')
+            elif suggestion:
+                r.update(category=suggestion[0],treatment=suggestion[1],reason=suggestion[2])
+            else:
+                r.update(reason=needs_purpose(r['description']))
             if advisor and r['category'] == '미분류':
                 suggestion = advisor(dict(r))
                 if suggestion in CATEGORIES:
@@ -292,6 +301,7 @@ def classify(rows, rules, existing=(), advisor=None):
             r.update(include=False,reviewed=False,reason='당월 청구 0원: 정산 제외·내용 확인')
         if r.get('outside_period'):
             r.update(include=False,reviewed=False,reason='대상월 밖의 사용: 제외·기간 확인')
+        r.update(suggested_category=r['category'],suggested_treatment=r['treatment'])
         result.append(r)
     return result
 

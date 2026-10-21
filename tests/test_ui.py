@@ -87,6 +87,35 @@ class UITests(unittest.TestCase):
             self.assertTrue(any('로컬 주소에만' in e.value for e in at.error))
             self.assertFalse(at.metric)
 
+    def test_legacy_mapping_review_reuses_draft_and_preserves_user_edit(self):
+        with patch.dict(os.environ,{'SETTLEMENT_MODE':'demo'}):
+            at=AppTest.from_file(str(APP)).run()
+            next(b for b in at.button if b.label=='가상 은행·카드 내역 불러오기').click().run()
+            draft_key=next(k for k,v in at.session_state.filtered_state.items() if k.startswith('new_') and isinstance(v,list) and v and isinstance(v[0],dict) and 'id' in v[0])
+            draft=at.session_state[draft_key]
+            row_id=draft[0]['id']
+            table_key=next(k for k in at.session_state.filtered_state if k.endswith('_editor'))
+            at.session_state[table_key]={'edited_rows':{0:{'category':'세금','treatment':'개인/제외','reviewed':True}},'added_rows':[],'deleted_rows':[]}
+            at.run()
+            store=Store('sqlite:///'+at.session_state['demo_path'])
+            store.save_setting('legacy_mapping:current',{'records':[{'description':'CJ대한통운','category':'기존택배'}],'excluded':[]})
+            at.run()
+            self.assertFalse(at.exception)
+            current=at.session_state[draft_key]
+            self.assertEqual(next(r for r in current if r['id']==row_id)['category'],'세금')
+            self.assertEqual(next(r for r in current if r['description']=='CJ대한통운')['category'],'기존택배')
+            self.assertTrue(any(h.value=='거래처별 빠른 분류' for h in at.subheader))
+
+    def test_confirm_recommendations_only_leaves_uncertain_for_review(self):
+        with patch.dict(os.environ,{'SETTLEMENT_MODE':'demo'}):
+            at=AppTest.from_file(str(APP)).run()
+            next(b for b in at.button if b.label=='가상 은행·카드 내역 불러오기').click().run()
+            next(c for c in at.checkbox if c.label.startswith('추천된 ')).check().run()
+            next(b for b in at.button if b.label=='추천 분류 한 번에 확인').click().run()
+            self.assertFalse(at.exception)
+            draft=next(v for k,v in at.session_state.filtered_state.items() if k.startswith('new_') and isinstance(v,list) and v and isinstance(v[0],dict) and 'id' in v[0])
+            self.assertTrue(all(r['reviewed'] for r in draft))
+
     def test_cloud_fail_closed_before_storage(self):
         with patch.dict(os.environ,{'SETTLEMENT_MODE':'cloud','SETTLEMENT_PASSWORD':''}):
             at=AppTest.from_file(str(APP)).run()

@@ -13,6 +13,7 @@ import streamlit as st
 from settlement.core import (CATEGORIES, TREATMENTS, ALIASES, CARD_ALIASES, digest, guess_columns,
     guess_header, parse_rows, classify, learn_rules, metrics, csv_safe, billing_month, use_in_month)
 from settlement.originals import read_original
+from settlement.classification import review_groups, apply_groups, read_legacy_mapping
 from settlement.checks import upload_summary, coverage_checks, duplicate_comparisons
 from settlement.store import Store, ConflictError
 
@@ -67,8 +68,11 @@ try:
 except Exception:
     st.error('저장소 연결에 실패했습니다. 관리자에게 DB 연결·접근 권한을 확인하세요.'); st.stop()
 
+legacy_settings=store.settings('legacy_mapping:')
+legacy_mapping=legacy_settings[0].get('records',[]) if legacy_settings else []
+legacy_excluded=legacy_settings[0].get('excluded',[]) if legacy_settings else []
 custom_categories = store.settings('category:')
-CATEGORIES = sorted(set(CATEGORIES + [c['name'] for c in custom_categories]))
+CATEGORIES = sorted(set(CATEGORIES + [c['name'] for c in custom_categories] + [c['category'] for c in legacy_mapping]))
 registered_cards=store.settings('card:')
 
 with st.sidebar:
@@ -118,7 +122,7 @@ view = st.radio('작업', ['새 파일 정산', '저장한 월정산', '분류 �
 def show_metrics(rows, target):
     m = metrics(rows)
     with target.container():
-        cols = st.columns(4)
+        cols = st.columns(2)+st.columns(2)
         cols[0].metric('월정산 수입', f"{m['income']:,}원")
         cols[1].metric('사업 지출 (환불 차감)', f"{m['expense']:,}원")
         cols[2].metric('최종 순수익 (월정산 기준)', f"{m['residual']:,}원")
@@ -178,6 +182,42 @@ def compare_duplicates(draft,key,batches=()):
         st.rerun()
     st.caption('동일 파일 안의 반복 후보는 최소 한 건을 남기거나, 모두 별개 거래임을 확인해 포함하세요. 다른 달의 정상 할부 청구는 중복으로 처리하지 않습니다.')
 
+def grouped_review(draft,key):
+    groups=review_groups(draft)
+    if not groups:
+        return
+    suggested=[g for g in groups if g['category']!='미분류' and not g['ambiguous']]
+    suggested_count=sum(g['count'] for g in suggested)
+    unknown_count=sum(g['count'] for g in groups if g['category']=='미분류' or g['ambiguous'])
+    st.subheader('거래처별 빠른 분류')
+    if legacy_mapping:
+        st.caption(f'기존 분류표 {len(legacy_mapping)}개를 재사용 중입니다. 기타·생활 및 기타 등 제외 설정은 분류 규칙에서 확인할 수 있습니다.')
+    st.caption(f'추천 분류 {suggested_count}건 · 용도 확인 {unknown_count}건 → 거래처 {len(groups)}묶음으로 검토할 수 있습니다. 중복·기간 밖·제외 거래는 아래에서 별도로 확인하세요.')
+    if suggested_count:
+        checked=st.checkbox(f'추천된 {suggested_count}건의 카테고리와 사업·개인 용도가 맞습니다',key=key+'_suggestion_confirm')
+        if st.button('추천 분류 한 번에 확인',key=key+'_approve_suggestions',disabled=not checked):
+            chosen=[dict(g,selected=True) for g in suggested]
+            st.session_state[key],count=apply_groups(draft,chosen)
+            st.session_state[key+'_revision']+=1
+            st.rerun()
+    st.caption('표의 한 줄은 같은 거래처의 여러 거래입니다. 선택을 체크하고 카테고리·처리 구분을 정한 뒤 적용하세요. 같은 결제명의 용도가 섞였으면 아래 상세 검색으로 나누어 수정하세요.')
+    frame=pd.DataFrame(groups)
+    labels={'selected':'선택','source':'자료','account':'계좌/카드','direction':'방향','description':'거래처/내역',
+            'count':'거래 수','total':'합계','minimum':'최소 금액','maximum':'최대 금액','category':'카테고리','treatment':'처리 구분'}
+    edited=st.data_editor(frame,key=key+'_groups_'+str(st.session_state[key+'_revision']),hide_index=True,
+        disabled=[c for c in frame.columns if c not in ('selected','category','treatment')],
+        column_order=['selected','description','category','treatment','count','total','source','account','direction','minimum','maximum'],
+        column_config={**{c:st.column_config.Column(label) for c,label in labels.items()},'ids':None,'group_id':None,'ambiguous':None,
+          'category':st.column_config.SelectboxColumn('카테고리',options=sorted(set(CATEGORIES+[g['category'] for g in groups])),required=True),
+          'treatment':st.column_config.SelectboxColumn('처리 구분',options=TREATMENTS,required=True)},width='stretch')
+    if st.button('선택한 거래처 분류 적용',key=key+'_apply_groups'):
+        try:
+            st.session_state[key],count=apply_groups(draft,edited.to_dict('records'))
+            st.session_state[key+'_revision']+=1
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+
 def editor(rows, key, batches=()):
     """Always merge visible edits into full session draft, then calculate metrics."""
     slot = st.empty()
@@ -185,6 +225,22 @@ def editor(rows, key, batches=()):
         st.session_state[key] = [dict(r,card_account=r.get('card_account','')) for r in rows]
         st.session_state[key+'_revision'] = 0
     draft = st.session_state[key]
+    suggestions={r['id']:r for r in rows}
+    changed=False
+    for r in draft:
+        candidate=suggestions.get(r['id'])
+        if candidate and not r['reviewed'] and r.get('purpose_ambiguous',False)!=candidate.get('purpose_ambiguous',False):
+            r['purpose_ambiguous']=candidate.get('purpose_ambiguous',False)
+            changed=True
+        if candidate and candidate.get('duplicate') and not r.get('duplicate'):
+            r.update(duplicate=True,include=False,reviewed=False,reason=candidate['reason'])
+            changed=True
+        if candidate and not r['reviewed'] and (r['category']=='미분류' or (r.get('suggested_category')==r['category'] and r.get('suggested_treatment')==r['treatment'])) and candidate['category']!='미분류' and (r['category'],r['treatment'])!=(candidate['category'],candidate['treatment']):
+            r.update(category=candidate['category'],treatment=candidate['treatment'],reason=candidate['reason'],suggested_category=candidate['category'],suggested_treatment=candidate['treatment'],purpose_ambiguous=candidate.get('purpose_ambiguous',False))
+            changed=True
+    if changed:
+        st.session_state[key+'_revision']+=1
+    grouped_review(draft,key)
     months=sorted({r['month'] for r in draft},reverse=True)
     metric_month=st.selectbox('지표 기준월',months,key=key+'_metric_month')
     if len(months)>1:
@@ -309,9 +365,11 @@ if view == '새 파일 정산':
                         row['card_account']='사업카드'
                 demo_rows.extend(rs)
                 demo_batches.append(dict(id=rs[0]['batch_id'],filename=src+' 가상 예시',source=src,account=account,source_rows=len(f),error_count=len(errors),card_kind='청구내역' if src=='카드' else '은행 거래'))
-            classified=classify(demo_rows,store.settings('rule:'),store.rows())
+            classified=classify(demo_rows,store.settings('rule:'),store.rows(),legacy_mapping=legacy_mapping,legacy_excluded=legacy_excluded)
             st.session_state.demo_import=(classified,demo_batches)
         staged_rows,batches=st.session_state.get('demo_import',([],[]))
+        if staged_rows:
+            staged_rows=classify(staged_rows,store.settings('rule:'),store.rows(),legacy_mapping=legacy_mapping,legacy_excluded=legacy_excluded)
         file_checks=batches
         parsed_for_summary=staged_rows
     else:
@@ -471,7 +529,7 @@ if view == '새 파일 정산':
                     st.error(f'파일 설정을 확인하세요: {e}')
                 file_checks.append(meta)
         if staged_rows:
-            staged_rows=classify(staged_rows,store.settings('rule:'),store.rows())
+            staged_rows=classify(staged_rows,store.settings('rule:'),store.rows(),legacy_mapping=legacy_mapping,legacy_excluded=legacy_excluded)
     if file_checks:
         st.subheader('업로드 확인표')
         overrides={r['id']:r for r in staged_rows}
@@ -483,6 +541,13 @@ if view == '새 파일 정산':
             st.warning('정산 대상월 밖의 거래가 있습니다: '+', '.join(other_months)+' · 의도한 기간인지 확인하세요.')
     if staged_rows:
         key='new_'+digest([staged_rows,profiles])[:16]
+        # Preserve the current user's edits when newly available recommendations change.
+        ids={(r['id'],r['fingerprint']) for r in staged_rows}
+        for previous_key in list(st.session_state):
+            prior=st.session_state[previous_key]
+            if previous_key.startswith('new_') and isinstance(prior,list) and prior and all(isinstance(r,dict) and 'id' in r for r in prior) and {(r['id'],r.get('fingerprint')) for r in prior}==ids:
+                key=previous_key
+                break
         draft=editor(staged_rows,key,batches)
         remember,scoped=rule_options(key)
         coverage_ok=card_review(draft,key,sorted({target_month} | {r['month'] for r in draft}))
@@ -527,6 +592,22 @@ elif view == '저장한 월정산':
             st.success('수정 내용을 저장했습니다.')
 
 elif view == '분류 규칙':
+    st.subheader('기존 분류표 가져오기')
+    st.caption('기존 시트의 mapping만 읽습니다. 과거 거래와 원본 시트는 변경하지 않습니다. 처음 가져온 분류는 추천으로 표시하고 확인 후 사용합니다.')
+    if legacy_mapping:
+        st.success(f'기존 분류표 {len(legacy_mapping)}개 적용 중 · 정산 제외: '+', '.join(legacy_excluded))
+    old_file=st.file_uploader('기존 mapping 시트 또는 전체 시트 백업',type=['xlsx','xls','csv'],key='legacy_mapping_upload')
+    if old_file:
+        try:
+            imported=read_legacy_mapping(old_file.getvalue(),old_file.name)
+            old_categories=sorted({r['category'] for r in imported})
+            excluded=st.multiselect('기존 앱처럼 사업 정산에서 제외할 카테고리',old_categories,default=[c for c in ['기타','생활 및 기타'] if c in old_categories])
+            st.caption(f'읽은 분류 {len(imported)}개 · 기존 앱 기본 제외값은 기타·생활 및 기타입니다. 필요한 경우 변경하세요.')
+            if st.button('기존 분류표를 추천에 적용'):
+                store.save_setting('legacy_mapping:current',dict(records=imported,excluded=excluded,filename=old_file.name,hash=hashlib.sha256(old_file.getvalue()).hexdigest()))
+                st.rerun()
+        except ValueError as error:
+            st.error(str(error))
     st.write('확인한 거래를 바탕으로 기억한 규칙입니다. 잘못된 규칙은 비활성화하세요.')
     rules=store.settings('rule:')
     if rules:

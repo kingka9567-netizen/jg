@@ -16,6 +16,8 @@ from settlement.originals import read_original
 from settlement.classification import review_groups, apply_groups, read_legacy_mapping
 from settlement.checks import upload_summary, coverage_checks, duplicate_comparisons
 from settlement.store import Store, ConflictError
+from settlement.workflow import row_digest, ClosedPeriodError
+from settlement.report import monthly_xlsx
 
 st.set_page_config(page_title='월별 정산 내역', page_icon='📒', layout='wide')
 
@@ -49,7 +51,9 @@ if MODE != 'demo':
             st.error('비밀번호를 확인하세요.')
         st.stop()
 
-if MODE == 'demo':
+if MODE == 'demo' and PREVIEW_PATHS:
+    database_url=os.environ.get('SETTLEMENT_PREVIEW_DATABASE_URL','sqlite:///'+str(Path(__file__).resolve().parent/'data'/'local-preview.sqlite3'))
+elif MODE == 'demo':
     if 'demo_path' not in st.session_state:
         st.session_state.demo_path = str(Path(tempfile.mkdtemp(prefix='settlement-demo-'))/'demo.sqlite3')
     database_url = 'sqlite:///' + st.session_state.demo_path
@@ -69,6 +73,16 @@ except Exception:
     st.error('저장소 연결에 실패했습니다. 관리자에게 DB 연결·접근 권한을 확인하세요.'); st.stop()
 
 legacy_settings=store.settings('legacy_mapping:')
+preview_mapping_path=os.environ.get('SETTLEMENT_PREVIEW_MAPPING','')
+if PREVIEW_PATHS and preview_mapping_path and not legacy_settings:
+    try:
+        mapping_file=Path(preview_mapping_path)
+        mapping_data=mapping_file.read_bytes()
+        records=read_legacy_mapping(mapping_data,mapping_file.name)
+        store.save_setting('legacy_mapping:current',dict(records=records,excluded=['기타','생활 및 기타'],filename=mapping_file.name,hash=hashlib.sha256(mapping_data).hexdigest()))
+        legacy_settings=store.settings('legacy_mapping:')
+    except (OSError,ValueError):
+        st.error('로컬 검토용 기존 분류표를 읽지 못했습니다.'); st.stop()
 legacy_mapping=legacy_settings[0].get('records',[]) if legacy_settings else []
 legacy_excluded=legacy_settings[0].get('excluded',[]) if legacy_settings else []
 custom_categories = store.settings('category:')
@@ -80,7 +94,7 @@ with st.sidebar:
     menu = st.radio('대메뉴', ['월별 정산 내역', '월별 사업 분석 보고서'])
     if MODE == 'demo':
         if PREVIEW_PATHS:
-            st.info('실제 자료 로컬 검토 · 원본은 읽기만 합니다. 기존 운영 자료와 분리된 임시 검토 공간입니다.')
+            st.info('실제 자료 로컬 검토 · 원본은 읽기만 합니다. 임시 작업과 자동 복구본은 이 컴퓨터에 보관하며 기존 운영 자료와 분리합니다.')
         else:
             st.warning('체험 모드 · 가상 자료\n실제 자료는 운영 모드에서 업로드하세요.')
     else:
@@ -117,7 +131,9 @@ if menu == '월별 사업 분석 보고서':
 
 st.title('월별 정산 내역')
 st.caption('파일 업로드 → 확인이 필요한 거래 검토 → 월정산 저장')
-view = st.radio('작업', ['새 파일 정산', '저장한 월정산', '분류 규칙', '백업'], horizontal=True)
+if 'work_view' not in st.session_state:
+    st.session_state.work_view='임시 저장 이어하기' if store.drafts() else '새 파일 정산'
+view = st.radio('작업', ['새 파일 정산', '임시 저장 이어하기', '저장한 월정산', '분류 규칙', '백업'], horizontal=True,key='work_view')
 
 def show_metrics(rows, target):
     m = metrics(rows)
@@ -218,10 +234,72 @@ def grouped_review(draft,key):
         except ValueError as error:
             st.error(str(error))
 
-def editor(rows, key, batches=()):
+def autosave(draft,key,context,ident):
+    try:
+        if context.get('kind')=='edit':
+            current={r['id']:r for r in store.rows(context['month'])}
+            fields=('category','treatment','include','reviewed','card_account','duplicate_resolution')
+            if len(current)==len(draft) and all(r['id'] in current and all((r.get(f) or '')==(current[r['id']].get(f) or '') for f in fields) for r in draft):
+                previous=store.draft(ident)
+                if previous and previous['status']=='active':store.archive_draft(ident,previous['version'],'수정값이 저장된 내용과 같아 작업 종료')
+                st.session_state.pop(key+'_draft_version',None)
+                st.session_state[key+'_autosave_failed']=False
+                return
+        if key+'_draft_version' not in st.session_state:
+            previous=store.draft(ident)
+            st.session_state[key+'_draft_version']=previous['version'] if previous and previous['status'] in ('active','archived') else 0
+        saved=store.save_draft(ident,draft,context,st.session_state[key+'_draft_version'])
+        st.session_state[key+'_draft_version']=saved['version']
+        st.session_state[key+'_autosave_failed']=False
+        st.caption('자동 임시 저장 완료 · '+saved['updated_at']+' · 창을 다시 열면 임시 저장 이어하기에서 계속할 수 있습니다.')
+    except (ValueError,ConflictError) as error:
+        st.session_state[key+'_autosave_failed']=True
+        st.error(str(error))
+    except Exception:
+        st.session_state[key+'_autosave_failed']=True
+        st.error('자동 임시 저장에 실패했습니다. 창을 닫기 전에 CSV를 내려받고 저장소 연결을 확인하세요.')
+
+
+def workflow_report(month,rows,readonly=False):
+    period=store.period(month)
+    st.subheader('월정산 상태 · '+('확정' if period['status']=='finalized' else '검토 중'))
+    if period['status']=='finalized':
+        st.success(f"{month} · {period['revision']}차 확정 · {period['finalized_at']}")
+        with st.expander('확정 해제 후 수정'):
+            reason=st.text_input('확정 해제 사유',key='reopen_reason_'+month)
+            if st.button('사유를 남기고 확정 해제',disabled=not reason.strip(),key='reopen_'+month):
+                try:
+                    store.reopen_month(month,reason,period['version']);st.rerun()
+                except ValueError as error:st.error(str(error))
+    else:
+        st.caption('모든 검토와 정산 저장을 마치면 확정할 수 있습니다. 확정한 월은 사유를 남겨 해제하기 전까지 수정할 수 없습니다.')
+        confirmed=st.checkbox('이 월의 전체 파일·기간·건수·합계와 카드 누락 여부를 최종 확인했습니다',key='final_confirm_'+month)
+        if st.button('월정산 확정',key='finalize_'+month,disabled=not confirmed):
+            try:
+                store.finalize_month(month,row_digest(rows),coverage_confirmed=True,upload_confirmed=confirmed);st.rerun()
+            except ValueError as error:st.error(str(error))
+    try:
+        st.caption('엑셀과 확정은 마지막 정산 저장 내용이 기준입니다. 편집 중인 내용은 수정 저장 후 반영됩니다.')
+        exported=monthly_xlsx(month,store.rows(),store.batches(),period,store.month_history(month))
+        st.download_button('월정산 엑셀 다운로드',exported,month+'-'+('확정' if period['status']=='finalized' else '검토중')+'.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='xlsx_'+month)
+    except Exception:
+        st.error('엑셀 생성에 실패했습니다. 저장된 자료를 다시 불러와 확인하세요.')
+    events=store.month_history(month)
+    with st.expander('정산 변경 이력'):
+        if events:
+            st.dataframe(pd.DataFrame([dict(일시=e['created_at'],작업=e['action'],사유=e.get('reason','')) for e in events]),hide_index=True)
+        else:st.caption('아직 변경 이력이 없습니다.')
+
+
+def editor(rows, key, batches=(), draft_context=None, draft_id=None):
     """Always merge visible edits into full session draft, then calculate metrics."""
     slot = st.empty()
     if key not in st.session_state:
+        recovered=store.draft(draft_id) if draft_id else None
+        if recovered and recovered['status']=='active':
+            if draft_context and (draft_context.get('kind')=='edit' or {(r['id'],r['fingerprint']) for r in recovered['rows']}=={(r['id'],r['fingerprint']) for r in rows}):
+                rows=recovered['rows']
+            st.session_state[key+'_draft_version']=recovered['version']
         st.session_state[key] = [dict(r,card_account=r.get('card_account','')) for r in rows]
         st.session_state[key+'_revision'] = 0
     draft = st.session_state[key]
@@ -324,6 +402,8 @@ def editor(rows, key, batches=()):
         expenses = pd.DataFrame(counts)
         expenses['지출'] = expenses['outflow'] - expenses['inflow'].where(expenses['source']=='카드', 0)
         st.bar_chart(expenses.groupby('category')['지출'].sum())
+    if draft_context is not None and draft_id:
+        autosave(draft,key,draft_context,draft_id)
     st.download_button('현재 내역 CSV', csv_safe(pd.DataFrame(draft)), '월정산.csv', key=key+'_csv')
     return draft
 
@@ -548,19 +628,57 @@ if view == '새 파일 정산':
             if previous_key.startswith('new_') and isinstance(prior,list) and prior and all(isinstance(r,dict) and 'id' in r for r in prior) and {(r['id'],r.get('fingerprint')) for r in prior}==ids:
                 key=previous_key
                 break
-        draft=editor(staged_rows,key,batches)
+        draft_id=digest(['upload',sorted(b['id'] for b in batches)])
+        draft_context=dict(kind='upload',month=target_month,batches=batches,profiles=profiles,problems=problems)
+        draft=editor(staged_rows,key,batches,draft_context,draft_id)
         remember,scoped=rule_options(key)
         coverage_ok=card_review(draft,key,sorted({target_month} | {r['month'] for r in draft}))
         upload_ok=st.checkbox('업로드 확인표의 파일별 기간·건수·금액을 원본과 대조했습니다',key=key+'_upload_checked')
-        if st.button('검토한 정산 저장',type='primary',disabled=bool(problems) or not coverage_ok or not upload_ok):
+        if st.button('검토한 정산 저장',type='primary',disabled=bool(problems) or not coverage_ok or not upload_ok or st.session_state.get(key+'_autosave_failed',False)):
             try:
-                store.import_rows(batches,draft,learn_rules(draft,scoped) if remember else [],profiles,coverage_confirmed=coverage_ok)
+                store.import_rows(batches,draft,learn_rules(draft,scoped) if remember else [],profiles,coverage_confirmed=coverage_ok,draft_id=draft_id,draft_version=st.session_state.get(key+'_draft_version'))
                 st.session_state.pop('demo_import',None)
                 st.success('저장했습니다. 저장한 월정산에서 월별로 확인할 수 있습니다.')
             except ValueError as e:
                 st.error(str(e))
             except Exception:
                 st.error('저장에 실패해 작업을 취소했습니다. DB 연결을 확인하세요.')
+
+elif view == '임시 저장 이어하기':
+    drafts=store.drafts()
+    if not drafts:
+        st.info('이어갈 임시 작업이 없습니다. 새 파일 정산에서 작업하면 자동으로 저장됩니다.')
+    else:
+        picked=st.selectbox('이어갈 임시 작업',[d['id'] for d in drafts],format_func=lambda ident:next((d['context'].get('month','')+' · '+str(len(d['rows']))+'건 · '+d['updated_at']) for d in drafts if d['id']==ident))
+        saved=store.draft(picked);context=saved['context'];key='resume_'+picked
+        if st.button('최신 임시 작업 다시 불러오기'):
+            st.session_state.pop(key,None);st.session_state.pop(key+'_draft_version',None);st.rerun()
+        draft=editor(saved['rows'],key,context.get('batches',[]),context,picked)
+        with st.expander('이전 임시 저장 상태로 복원'):
+            versions=store.draft_versions(picked)
+            number=st.selectbox('복원할 임시 저장 회차',[v['version'] for v in versions])
+            if st.button('선택한 회차로 복원'):
+                try:
+                    store.restore_draft_version(picked,number,st.session_state[key+'_draft_version'])
+                    st.session_state.pop(key,None);st.session_state.pop(key+'_draft_version',None);st.rerun()
+                except ValueError as error:st.error(str(error))
+        remember,scoped=rule_options(key)
+        coverage_ok=card_review(draft,key)
+        checked=st.checkbox('업로드 확인표의 파일별 기간·건수·금액을 원본과 대조했습니다',key=key+'_upload_checked')
+        if context.get('problems'):st.error('원본 설정 오류가 있는 작업입니다. 원본 파일을 다시 올려 오류를 해결하세요.')
+        if st.button('이어한 작업 정산 저장',disabled=not coverage_ok or not checked or bool(context.get('problems')) or st.session_state.get(key+'_autosave_failed',False)):
+            try:
+                args=dict(coverage_confirmed=True,draft_id=picked,draft_version=st.session_state[key+'_draft_version'])
+                if context.get('kind')=='edit':store.edit_rows(draft,learn_rules(draft,scoped) if remember else [],**args)
+                else:store.import_rows(context['batches'],draft,learn_rules(draft,scoped) if remember else [],context.get('profiles',[]),**args)
+                st.success('정산 저장을 완료했습니다. 저장한 월정산에서 확정할 수 있습니다.')
+            except ValueError as error:st.error(str(error))
+        with st.expander('이 작업 보관 종료'):
+            reason=st.text_input('보관 종료 사유')
+            if st.button('임시 작업 보관 종료',disabled=not reason.strip()):
+                try:
+                    store.archive_draft(picked,st.session_state[key+'_draft_version'],reason);st.rerun()
+                except ValueError as error:st.error(str(error))
 
 elif view == '저장한 월정산':
     months = store.months()
@@ -574,22 +692,26 @@ elif view == '저장한 월정산':
             st.session_state[key+'_revision'] = st.session_state.get(key+'_revision',0)+1
             st.rerun()
         original = store.rows(month)
-        draft=editor(original,key)
-        remember,scoped=rule_options(key)
-        coverage_ok=card_review(draft,key)
-        if st.button('수정 저장',type='primary',disabled=not coverage_ok):
-            try:
-                store.edit_rows(draft,learn_rules(draft,scoped) if remember else [],coverage_confirmed=coverage_ok)
-                st.session_state.pop(key,None)
-                st.session_state[key+'_revision'] += 1
-                st.session_state['saved_notice'] = True
-                st.rerun()
-            except ValueError as e:
-                st.error(str(e))
-            except Exception:
-                st.error('저장 실패. DB 연결을 확인하세요. 변경은 취소했습니다.')
-        if st.session_state.pop('saved_notice',False):
-            st.success('수정 내용을 저장했습니다.')
+        period=store.period(month)
+        workflow_report(month,original)
+        if period['status']=='finalized':
+            show_metrics(original,st.empty())
+            st.dataframe(pd.DataFrame(original),hide_index=True,width='stretch')
+        else:
+            ident=digest(['edit',month,row_digest(original)])
+            context=dict(kind='edit',month=month,batches=store.batches())
+            draft=editor(original,key,store.batches(),context,ident)
+            remember,scoped=rule_options(key)
+            coverage_ok=card_review(draft,key)
+            changed=any(any(r.get(f)!=next(o for o in original if o['id']==r['id']).get(f) for f in ('category','treatment','include','reviewed','card_account','duplicate_resolution')) for r in draft)
+            if st.button('수정 저장',type='primary',disabled=not changed or not coverage_ok or st.session_state.get(key+'_autosave_failed',False)):
+                try:
+                    store.edit_rows(draft,learn_rules(draft,scoped) if remember else [],coverage_confirmed=coverage_ok,draft_id=ident,draft_version=st.session_state.get(key+'_draft_version'))
+                    st.session_state.pop(key,None);st.session_state.pop(key+'_draft_version',None)
+                    st.session_state[key+'_revision']+=1;st.session_state['saved_notice']=True;st.rerun()
+                except ValueError as error:st.error(str(error))
+                except Exception:st.error('저장 실패. 연결을 확인하세요. 변경은 취소했습니다.')
+        if st.session_state.pop('saved_notice',False):st.success('수정 내용을 저장했습니다.')
 
 elif view == '분류 규칙':
     st.subheader('기존 분류표 가져오기')
@@ -623,6 +745,13 @@ elif view == '분류 규칙':
         st.info('정산 검토 후 저장하면 규칙이 만들어집니다.')
 
 elif view == '백업':
+    st.subheader('자동 복구본')
+    st.caption('임시 작업은 변경할 때 저장합니다. 일일 자동 복구본과 정산 저장·수정·확정 전 복구본을 보관합니다. 같은 DB의 복구본은 공급자 장애 대비 외부 백업을 대신하지 않습니다. JSON도 별도로 내려받아 보관하세요.')
+    copies=store.backups()
+    if copies:
+        chosen=st.selectbox('내려받을 자동 복구본',[b['id'] for b in copies],format_func=lambda ident:next(b['created_at']+' · '+b['reason'] for b in copies if b['id']==ident))
+        st.download_button('선택한 복구본 JSON 다운로드',store.backup_bytes(chosen),'settlement-recovery.json',mime='application/json')
+    else:st.caption('저장 작업이 생기면 자동 복구본을 만듭니다.')
     st.write('거래·파일 식별값·분류 규칙·열 매핑·수정 이력을 JSON으로 내려받습니다. 원본 엑셀은 별도 보관하세요.')
     if st.button('최신 백업 생성'):
         st.session_state.backup=store.export()

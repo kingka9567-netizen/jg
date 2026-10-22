@@ -69,7 +69,7 @@ class UITests(unittest.TestCase):
         original_get_option=st.get_option
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp)/'original.xls';p.write_bytes(hyundai_file())
-            env={'SETTLEMENT_MODE':'demo','SETTLEMENT_PREVIEW_FILES':json.dumps([str(p)]),'SETTLEMENT_PREVIEW_MONTH':'2026-09'}
+            env={'SETTLEMENT_MODE':'demo','SETTLEMENT_PREVIEW_FILES':json.dumps([str(p)]),'SETTLEMENT_PREVIEW_MONTH':'2026-09','SETTLEMENT_PREVIEW_DATABASE_URL':'sqlite:///'+str(Path(tmp)/'preview.sqlite3')}
             with patch.dict(os.environ,env),patch('streamlit.get_option',side_effect=lambda key: '127.0.0.1' if key=='server.address' else original_get_option(key)):
                 at=AppTest.from_file(str(APP)).run()
                 self.assertFalse(at.exception);self.assertFalse(at.error)
@@ -115,6 +115,44 @@ class UITests(unittest.TestCase):
             self.assertFalse(at.exception)
             draft=next(v for k,v in at.session_state.filtered_state.items() if k.startswith('new_') and isinstance(v,list) and v and isinstance(v[0],dict) and 'id' in v[0])
             self.assertTrue(all(r['reviewed'] for r in draft))
+
+    def test_autosave_resumes_after_new_browser_session_without_source_files(self):
+        from test_originals import hyundai_file
+        with tempfile.TemporaryDirectory() as tmp:
+            f=io.BytesIO(hyundai_file());f.name='original.xls'
+            url='sqlite:///'+str(Path(tmp)/'persistent.sqlite3')
+            env={'SETTLEMENT_MODE':'local','SETTLEMENT_PASSWORD':'test-password-long-enough','SETTLEMENT_DATABASE_URL':url}
+            with patch.dict(os.environ,env),patch('streamlit.file_uploader',return_value=[f]):
+                at=AppTest.from_file(str(APP)).run();at.session_state['authenticated']=True;at.run()
+                drafts=Store(url).drafts();self.assertEqual(len(drafts),1)
+                self.assertEqual(len(drafts[0]['rows']),3)
+            with patch.dict(os.environ,env),patch('streamlit.file_uploader',return_value=[]):
+                fresh=AppTest.from_file(str(APP)).run();fresh.session_state['authenticated']=True;fresh.run()
+                next(r for r in fresh.radio if r.label=='작업').set_value('임시 저장 이어하기').run()
+                self.assertFalse(fresh.exception)
+                self.assertEqual(fresh.metric[1].value,'151,000원')
+                self.assertTrue(any('자동 임시 저장 완료' in c.value for c in fresh.caption))
+
+    def test_finalization_reopen_and_excel_ui_flow(self):
+        with patch.dict(os.environ,{'SETTLEMENT_MODE':'demo'}):
+            at=AppTest.from_file(str(APP)).run()
+            next(b for b in at.button if b.label=='가상 은행·카드 내역 불러오기').click().run()
+            next(c for c in at.checkbox if c.label.startswith('추천된 ')).check().run()
+            next(b for b in at.button if b.label=='추천 분류 한 번에 확인').click().run()
+            next(c for c in at.checkbox if c.label=='카드별 사용월·전체 건수·합계를 확인했습니다').check().run()
+            next(c for c in at.checkbox if c.label=='업로드 확인표의 파일별 기간·건수·금액을 원본과 대조했습니다').check().run()
+            next(b for b in at.button if b.label=='검토한 정산 저장').click().run()
+            next(r for r in at.radio if r.label=='작업').set_value('저장한 월정산').run()
+            self.assertFalse(at.exception)
+            next(c for c in at.checkbox if c.label.startswith('이 월의 전체 파일')).check().run()
+            next(b for b in at.button if b.label=='월정산 확정').click().run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any('1차 확정' in s.value for s in at.success))
+            self.assertFalse(any(b.label=='수정 저장' for b in at.button))
+            next(t for t in at.text_input if t.label=='확정 해제 사유').set_value('카테고리 재확인').run()
+            next(b for b in at.button if b.label=='사유를 남기고 확정 해제').click().run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any(b.label=='수정 저장' for b in at.button))
 
     def test_cloud_fail_closed_before_storage(self):
         with patch.dict(os.environ,{'SETTLEMENT_MODE':'cloud','SETTLEMENT_PASSWORD':''}):

@@ -1,18 +1,23 @@
 """DB-API storage: append imports, targeted optimistic edits, atomic audit log."""
 import json
 import sqlite3
+import threading
+import atexit
 from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from .core import validate_rows, digest
 from .checks import coverage_checks
+from .workflow import Workflow
 
 class ConflictError(ValueError):
     pass
 
-class Store:
+class Store(Workflow):
     def __init__(self, url):
         self.url = url
+        self._pool=None
+        self._pool_lock=threading.Lock()
         self.pg = url.startswith(('postgresql://', 'postgres://'))
         if not self.pg and not url.startswith('sqlite:///'):
             raise ValueError('지원 저장소: sqlite:/// 또는 postgresql://')
@@ -23,14 +28,30 @@ class Store:
                 'CREATE INDEX IF NOT EXISTS settlement_month ON settlement_transactions(month)',
                 'CREATE TABLE IF NOT EXISTS settlement_settings (id TEXT PRIMARY KEY, payload TEXT NOT NULL)',
                 'CREATE TABLE IF NOT EXISTS settlement_audit (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL)',
+                'CREATE TABLE IF NOT EXISTS settlement_drafts (id TEXT PRIMARY KEY, version INTEGER NOT NULL, updated_at TEXT NOT NULL, payload TEXT NOT NULL)',
+                'CREATE TABLE IF NOT EXISTS settlement_draft_versions (id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(draft_id,version))',
+                'CREATE TABLE IF NOT EXISTS settlement_periods (month TEXT PRIMARY KEY, payload TEXT NOT NULL)',
+                'CREATE TABLE IF NOT EXISTS settlement_backups (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL)',
             ]:
                 self.execute(c, statement)
 
     @contextmanager
     def connection(self, write=False):
         if self.pg:
-            import psycopg
-            c = psycopg.connect(self.url, connect_timeout=10)
+            try:
+                from psycopg_pool import ConnectionPool
+            except ImportError:
+                import psycopg
+                c=psycopg.connect(self.url,connect_timeout=10)
+            else:
+                with self._pool_lock:
+                    if self._pool is None:
+                        self._pool=ConnectionPool(self.url,min_size=0,max_size=3,max_idle=120,timeout=20,
+                            kwargs={'connect_timeout':10},check=ConnectionPool.check_connection,open=True)
+                        atexit.register(self._pool.close)
+                with self._pool.connection() as pooled:
+                    yield pooled
+                return
         else:
             path = self.url[len('sqlite:///'):]
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +95,8 @@ class Store:
 
     def save_setting(self, key, value):
         with self.connection(write=True) as c:
+            self._write_lock(c)
+            self._checkpoint(c,'설정 변경 전')
             self._setting(c, key, value)
 
     def _audit(self, c, payload):
@@ -81,7 +104,7 @@ class Store:
         self.execute(c, 'INSERT INTO settlement_audit(id,created_at,payload) VALUES (?,?,?)',
                      (digest([now, payload]), now, json.dumps(payload, ensure_ascii=False)))
 
-    def import_rows(self, batches, rows, rules=(), profiles=(), coverage_confirmed=False):
+    def import_rows(self, batches, rows, rules=(), profiles=(), coverage_confirmed=False, draft_id=None, draft_version=None):
         validate_rows(rows)
         batch_ids = {b['id'] for b in batches}
         if {r['batch_id'] for r in rows} != batch_ids:
@@ -90,6 +113,8 @@ class Store:
             with self.connection(write=True) as c:
                 if self.pg:
                     self.execute(c, 'SELECT pg_advisory_xact_lock(716294018)')
+                self._assert_open(c,[r['month'] for r in rows])
+                self._checkpoint(c,'정산 자료 저장 전')
                 current_rows=[json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_transactions').fetchall()]
                 self._check_coverage(c,rows,current_rows,coverage_confirmed)
                 current_fingerprints={r['fingerprint'] for r in current_rows}
@@ -106,6 +131,7 @@ class Store:
                     self._setting(c, 'rule:'+rule['id'], rule)
                 for profile in profiles:
                     self._setting(c, 'profile:'+profile['id'], profile)
+                self._finish_draft(c,draft_id,draft_version)
                 self._audit(c, {'action': 'import', 'batches': batches, 'after': rows,'coverage_confirmed':coverage_confirmed})
         except Exception as e:
             # Never conceal connection/credential errors behind a duplicate message.
@@ -113,11 +139,13 @@ class Store:
                 raise ConflictError('이미 저장한 파일 또는 거래입니다. 전체 작업을 취소했습니다.') from e
             raise
 
-    def edit_rows(self, rows, rules=(), coverage_confirmed=False):
+    def edit_rows(self, rows, rules=(), coverage_confirmed=False, draft_id=None, draft_version=None):
         validate_rows(rows)
         with self.connection(write=True) as c:
             if self.pg:
                 self.execute(c, 'SELECT pg_advisory_xact_lock(716294018)')
+            self._assert_open(c,[r['month'] for r in rows])
+            self._checkpoint(c,'정산 내역 수정 전')
             current_rows=[json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_transactions').fetchall()]
             self._check_coverage(c,rows,current_rows,coverage_confirmed)
             before = []
@@ -140,6 +168,7 @@ class Store:
                 before.append(previous)
             for rule in rules:
                 self._setting(c, 'rule:'+rule['id'], rule)
+            self._finish_draft(c,draft_id,draft_version)
             self._audit(c, {'action': 'edit', 'before': before, 'after': rows,'coverage_confirmed':coverage_confirmed})
 
     def batch_ids(self):
@@ -168,11 +197,8 @@ class Store:
                 self.execute(c, 'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
             else:
                 c.execute('BEGIN')
-            result = {'schema_version': 1, 'exported_at': datetime.now(timezone.utc).isoformat()}
-            for name in ['batches', 'transactions']:
-                result[name] = [json.loads(p) for (p,) in self.execute(c, 'SELECT payload FROM settlement_'+name).fetchall()]
-            result['settings'] = [dict(id=k,payload=json.loads(p)) for k,p in self.execute(c, 'SELECT id,payload FROM settlement_settings').fetchall()]
-            result['audit'] = [dict(id=k,created_at=t,payload=json.loads(p)) for k,t,p in self.execute(c, 'SELECT id,created_at,payload FROM settlement_audit').fetchall()]
+            result=self._snapshot(c)
+            result['backups']=[json.loads(p) for (p,) in self.execute(c,'SELECT payload FROM settlement_backups').fetchall()]
             return json.dumps(result, ensure_ascii=False, indent=2).encode()
 
 def restore_to_new_sqlite(backup, target):
@@ -183,7 +209,7 @@ def restore_to_new_sqlite(backup, target):
     if target.exists():
         raise ValueError('복원 대상이 이미 존재합니다. 새 경로를 지정하세요.')
     data = json.loads(backup)
-    if data.get('schema_version') != 1:
+    if data.get('schema_version') not in (1,2):
         raise ValueError('지원하지 않는 백업 버전')
     if data['transactions']:
         validate_rows(data['transactions'])
@@ -203,6 +229,14 @@ def restore_to_new_sqlite(backup, target):
                                  (row['id'],row['month'],row['version'],json.dumps(row,ensure_ascii=False)))
             for setting in data['settings']:
                 restored._setting(c,setting['id'],setting['payload'])
+            for name,keys in [('drafts',('id','version','updated_at')),('draft_versions',('id','draft_id','version')),('periods',('month',)),('backups',('id','created_at','kind'))]:
+                for value in data.get(name,[]):
+                    if name=='backups':
+                        values=[value['id'],value['created_at'],'restored']
+                        cols='id,created_at,kind'
+                    else:
+                        values=[value[k] for k in keys];cols=','.join(keys)
+                    restored.execute(c,'INSERT INTO settlement_'+name+'('+cols+',payload) VALUES ('+','.join('?' for _ in range(len(values)+1))+')',(*values,json.dumps(value,ensure_ascii=False)))
             for event in data['audit']:
                 restored.execute(c,'INSERT INTO settlement_audit(id,created_at,payload) VALUES (?,?,?)',
                                  (event['id'],event['created_at'],json.dumps(event['payload'],ensure_ascii=False)))

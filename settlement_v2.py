@@ -1,6 +1,5 @@
 """Run: python -m streamlit run settlement_v2.py"""
 import hashlib
-import hmac
 import io
 import json
 import os
@@ -18,6 +17,7 @@ from settlement.checks import upload_summary, coverage_checks, duplicate_compari
 from settlement.store import Store, ConflictError
 from settlement.workflow import row_digest, ClosedPeriodError
 from settlement.report import monthly_xlsx
+from settlement.auth import LoginGate, valid_password
 
 st.set_page_config(page_title='월별 정산 내역', page_icon='📒', layout='wide')
 
@@ -37,18 +37,29 @@ if PREVIEW_PATHS and (MODE!='demo' or st.get_option('server.address') not in ('1
     st.error('실제 자료 미리보기는 로컬 주소에만 열 수 있습니다.'); st.stop()
 if MODE != 'demo':
     password = config('SETTLEMENT_PASSWORD')
-    if len(password) < 16:
-        st.error('운영 데이터 접근 전에 Secrets에 16자 이상의 SETTLEMENT_PASSWORD를 설정하세요.'); st.stop()
+    if not valid_password(password):
+        st.error('Secrets의 SETTLEMENT_PASSWORD를 숫자 4자리 또는 16자 이상 비밀번호로 설정하세요.'); st.stop()
     if not st.session_state.get('authenticated'):
         st.title('월정산 로그인')
         with st.form('login'):
             supplied = st.text_input('비밀번호', type='password')
             login = st.form_submit_button('로그인')
+        st.caption('비밀번호를 5번 틀리면 15분 동안 로그인이 잠깁니다.')
         if login:
-            if hmac.compare_digest(supplied.encode(), password.encode()):
-                st.session_state.authenticated = True
-                st.rerun()
-            st.error('비밀번호를 확인하세요.')
+            try:
+                login_url=config('SETTLEMENT_DATABASE_URL', 'sqlite:///data/settlement.sqlite3' if MODE=='local' else '')
+                if MODE=='cloud' and not login_url.startswith(('postgresql://','postgres://')):
+                    raise ValueError('운영 저장소 설정 필요')
+                ok,wait=LoginGate(login_url).attempt(supplied,password)
+                if ok:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                if wait:
+                    st.error(f'로그인 시도 제한 중입니다. 약 {(wait+59)//60}분 후 다시 시도하세요.')
+                else:
+                    st.error('비밀번호를 확인하세요.')
+            except Exception:
+                st.error('로그인 확인에 실패했습니다. 잠시 후 다시 시도하세요.')
         st.stop()
 
 if MODE == 'demo' and PREVIEW_PATHS:
@@ -143,8 +154,9 @@ def show_metrics(rows, target):
         cols[1].metric('사업 지출 (환불 차감)', f"{m['expense']:,}원")
         cols[2].metric('최종 순수익 (월정산 기준)', f"{m['residual']:,}원")
         cols[3].metric('확인 필요', f"{m['pending']}건")
-        st.caption('최종 순수익은 수수료 차감 후 사업 입금 − 사업 지출입니다. 재고·미수금·감가상각 등을 반영하는 회계상 순이익과 다릅니다. 세금 예비비를 자동 차감하지 않습니다.')
-        st.caption(f"은행 순현금 증감: {m['bank_net']:,}원 · 포함된 은행 거래의 모든 입출금(이체·대출·카드대금 포함) 기준. 카드 일시불은 선택한 월의 사용액, 할부는 업로드한 명세서의 해당 회차 금액을 집계합니다. 납부 예정월은 참고 정보입니다. 월정산 잔여금과 통장 잔액은 다를 수 있습니다.")
+        with st.expander('계산 기준 보기'):
+            st.caption('최종 순수익은 수수료 차감 후 사업 입금 − 사업 지출입니다. 재고·미수금·감가상각 등을 반영하는 회계상 순이익과 다릅니다. 세금 예비비를 자동 차감하지 않습니다.')
+            st.caption(f"은행 순현금 증감: {m['bank_net']:,}원 · 포함된 은행 거래의 모든 입출금(이체·대출·카드대금 포함) 기준. 카드 일시불은 선택한 월의 사용액, 할부는 업로드한 명세서의 해당 회차 금액을 집계합니다. 납부 예정월은 참고 정보입니다. 월정산 잔여금과 통장 잔액은 다를 수 있습니다.")
         if m['pending']:
             st.warning('검토 전 예상 합계입니다. 미확인 사업 거래도 포함하며, 중복 후보는 기본 제외합니다.')
 
@@ -154,9 +166,10 @@ def card_review(rows,key,months=()):
     if not has_card:
         return True
     st.subheader('카드 사용자료 누락 점검')
-    if checks:
-        table=pd.DataFrame(checks).rename(columns={'month':'정산월','account':'카드','status':'상태','message':'확인 내용'})
-        st.dataframe(table.drop(columns='blocking'),hide_index=True,width='stretch')
+    with st.expander('카드별 누락 점검 상세'):
+        if checks:
+            table=pd.DataFrame(checks).rename(columns={'month':'정산월','account':'카드','status':'상태','message':'확인 내용'})
+            st.dataframe(table.drop(columns='blocking'),hide_index=True,width='stretch')
     missing=[c for c in checks if c['blocking']]
     if missing:
         st.error('누락 또는 미연결 카드가 있습니다. 카드 사용자료 업로드, 대상 카드 연결, 해당월 내역 없음 확인 중 필요한 조치를 완료하세요.')
@@ -217,15 +230,41 @@ def grouped_review(draft,key):
             st.session_state[key+'_revision']+=1
             st.rerun()
     st.caption('표의 한 줄은 같은 거래처의 여러 거래입니다. 선택을 체크하고 카테고리·처리 구분을 정한 뒤 적용하세요. 같은 결제명의 용도가 섞였으면 아래 상세 검색으로 나누어 수정하세요.')
-    frame=pd.DataFrame(groups)
+    search=st.text_input('거래처 검색',key=key+'_group_search')
+    groups=[g for g in groups if not search or search.casefold() in g['description'].casefold()]
+    seed_key=key+'_group_seed'
+    seed=st.session_state.setdefault(seed_key,{})
+    for g in groups:
+        if g['group_id'] in seed:
+            g.update(seed[g['group_id']])
+    if st.session_state.get(key+'_group_filter')!=search:
+        st.session_state[key+'_group_filter']=search
+        st.session_state[key+'_group_render']=st.session_state.get(key+'_group_render',0)+1
+        for g in groups:g['selected']=False
+    left,right=st.columns(2)
+    select_all=left.button('거래처 전체 선택',key=key+'_group_all',disabled=not groups)
+    clear_all=right.button('거래처 선택 해제',key=key+'_group_none',disabled=not groups)
+    if select_all or clear_all:
+        for g in groups:
+            g['selected']=bool(select_all)
+            seed[g['group_id']]={f:g[f] for f in ('selected','category','treatment')}
+        st.session_state[key+'_group_render']=st.session_state.get(key+'_group_render',0)+1
+    if not groups:
+        st.info('검색 결과가 없습니다.');return
+    group_snapshot=f'{key}_group_frame_{st.session_state[key+"_revision"]}_{st.session_state.get(key+"_group_render",0)}'
+    if group_snapshot not in st.session_state:st.session_state[group_snapshot]=pd.DataFrame(groups)
+    frame=st.session_state[group_snapshot]
     labels={'selected':'선택','source':'자료','account':'계좌/카드','direction':'방향','description':'거래처/내역',
             'count':'거래 수','total':'합계','minimum':'최소 금액','maximum':'최대 금액','category':'카테고리','treatment':'처리 구분'}
-    edited=st.data_editor(frame,key=key+'_groups_'+str(st.session_state[key+'_revision']),hide_index=True,
+    edited=st.data_editor(frame,key=key+'_groups_'+str(st.session_state[key+'_revision'])+'_'+str(st.session_state.get(key+'_group_render',0)),hide_index=True,
         disabled=[c for c in frame.columns if c not in ('selected','category','treatment')],
         column_order=['selected','description','category','treatment','count','total','source','account','direction','minimum','maximum'],
         column_config={**{c:st.column_config.Column(label) for c,label in labels.items()},'ids':None,'group_id':None,'ambiguous':None,
           'category':st.column_config.SelectboxColumn('카테고리',options=sorted(set(CATEGORIES+[g['category'] for g in groups])),required=True),
           'treatment':st.column_config.SelectboxColumn('처리 구분',options=TREATMENTS,required=True)},width='stretch')
+    for g in edited.to_dict('records'):
+        seed[g['group_id']]={f:g[f] for f in ('selected','category','treatment')}
+    st.caption(f"선택 {int(edited['selected'].sum())}묶음 / 검색 결과 {len(edited)}묶음")
     if st.button('선택한 거래처 분류 적용',key=key+'_apply_groups'):
         try:
             st.session_state[key],count=apply_groups(draft,edited.to_dict('records'))
@@ -318,9 +357,11 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
             changed=True
     if changed:
         st.session_state[key+'_revision']+=1
-    grouped_review(draft,key)
+    if review_groups(draft):
+        with st.expander('거래처별 묶어서 분류'):
+            grouped_review(draft,key)
     months=sorted({r['month'] for r in draft},reverse=True)
-    metric_month=st.selectbox('지표 기준월',months,key=key+'_metric_month')
+    metric_month=months[0] if len(months)==1 else st.selectbox('지표 기준월',months,key=key+'_metric_month')
     if len(months)>1:
         st.info('여러 달이 포함된 파일입니다. 상단 지표는 선택한 월만, 아래 검토 표와 저장은 모든 거래를 대상으로 합니다.')
     q = st.text_input('거래명 검색', key=key+'_search')
@@ -336,55 +377,84 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
                and (not review_only or not r['reviewed'] or (r['include'] and r['category']=='미분류'))
                and (not selected_cats or r['category'] in selected_cats)]
     rev = st.session_state[key+'_revision']
-    display_fields = ['id','date','month','source','account','description','inflow','outflow',
-                      'category','treatment','card_account','include','reviewed','reason','duplicate']
-    labels = dict(id='거래 ID',date='구매/거래일',month='정산월',source='자료 종류',account='계좌/카드',description='내역',
-                  inflow='입금/환불',outflow='출금/사용',category='카테고리',treatment='처리 구분',
-                  card_account='납부 대상 카드',include='포함',reviewed='확인',reason='분류 근거',duplicate='중복 후보')
-    # Keep the editor's input immutable for this filter/revision. Changing its input
-    # on every rerun can reset Streamlit's pending edits or drop newly reviewed rows.
-    snapshot_key=f'{key}_snapshot_{rev}_'+digest([q,review_only,selected_cats])[:12]
+    selection_key=key+'_selected_ids'
+    selected_ids=set(st.session_state.get(selection_key,[]))
+    if st.session_state.get(key+'_selection_filter')!=active_filter:
+        selected_ids=set()
+        st.session_state[key+'_selection_filter']=active_filter
+    current_ids={r['id'] for r in visible}
+    selected_ids &= current_ids
+    left,right=st.columns(2)
+    if left.button('전체 선택',key=key+'_select_all',disabled=not visible):
+        selected_ids=set(current_ids)
+        st.session_state[key+'_revision']+=1
+    if right.button('선택 해제',key=key+'_select_none',disabled=not visible):
+        selected_ids=set()
+        st.session_state[key+'_revision']+=1
+    st.session_state[selection_key]=list(selected_ids)
+    rev=st.session_state[key+'_revision']
+    display_fields=['id','date','description','inflow','outflow','category']
+    labels=dict(selected='선택',date='거래 날짜',description='거래 내역',inflow='입금',outflow='출금',category='카테고리')
+    snapshot_key=f'{key}_snapshot_{rev}_'+active_filter[:12]
     if snapshot_key not in st.session_state:
-        st.session_state[snapshot_key]=pd.DataFrame(visible)[display_fields] if visible else pd.DataFrame()
+        frame=pd.DataFrame(visible)[display_fields] if visible else pd.DataFrame()
+        if not frame.empty:frame.insert(0,'selected',[r in selected_ids for r in frame['id']])
+        st.session_state[snapshot_key]=frame
     frame=st.session_state[snapshot_key]
     if not frame.empty:
         visible_ids=set(frame['id'])
-        visible=[r for r in draft if r['id'] in visible_ids]
-        edited = st.data_editor(frame, key=snapshot_key+'_editor', hide_index=True,
-            disabled=[c for c in display_fields if c not in ['category','treatment','include','reviewed','card_account']],
-            column_config={
-                **{c: st.column_config.Column(label) for c,label in labels.items()},
-                'id': None,
-                'category': st.column_config.SelectboxColumn('카테고리', options=cats, required=True),
-                'treatment': st.column_config.SelectboxColumn('처리 구분', options=TREATMENTS, required=True),
-                'card_account': st.column_config.SelectboxColumn('납부 대상 카드',options=sorted({''} | {c['account'] for c in registered_cards} | {r['account'] for r in draft if r['source']=='카드'} | {r.get('card_account','') for r in draft})),
-            }, width='stretch')
-        updates = {r['id']:r for r in edited.to_dict('records')}
+        edited=st.data_editor(frame,key=snapshot_key+'_editor',hide_index=True,
+            disabled=['id','date','description','inflow','outflow'],
+            column_config={**{c:st.column_config.Column(label) for c,label in labels.items()},'id':None,
+                'category':st.column_config.SelectboxColumn('카테고리',options=cats,required=True)},width='stretch')
+        updates={r['id']:r for r in edited.to_dict('records')}
+        selected_ids={r['id'] for r in edited.to_dict('records') if r['selected']}
+        st.session_state[selection_key]=list(selected_ids)
+        edit_changed=False
         for r in draft:
-            if r['id'] in updates:
-                r.update({c: updates[r['id']][c] for c in ['category','treatment','include','reviewed','card_account']})
-                r['card_account']=r.get('card_account') or ''
-        st.caption('카드대금 납부·계좌이체·대출·개인/제외는 월정산 수입과 사업 지출에서 제외됩니다. 중복 후보는 실제 별개 거래라면 포함을 체크하세요.')
-        with st.expander('현재 검색 결과 일괄 수정'):
-            category = st.selectbox('일괄 카테고리', cats, key=key+'_bulk_category')
-            treatment = st.selectbox('일괄 처리 구분', TREATMENTS, key=key+'_bulk_treatment')
-            inclusion = st.selectbox('포함 여부', ['현재 값 유지','모두 포함','모두 제외'], key=key+'_bulk_include')
-            confirm = st.checkbox(f'현재 표시된 {len(visible)}건을 검토했습니다', key=key+'_bulk_confirm')
-            if st.button('현재 검색 결과 확인 처리 (분류 유지)', key=key+'_review', disabled=not confirm):
+            if r['id'] in updates and r['category']!=updates[r['id']]['category']:
+                r['category']=updates[r['id']]['category'];edit_changed=True
+        st.caption(f'선택 {len(selected_ids)}건 / 검색 결과 {len(visible_ids)}건 · 전체 선택은 현재 검색 결과에만 적용됩니다.')
+        category=st.selectbox('선택 거래 카테고리', ['현재 분류 유지']+cats,key=key+'_bulk_category')
+        if st.button('선택한 거래 확인',key=key+'_review',disabled=not selected_ids):
+            for r in draft:
+                if r['id'] in selected_ids:
+                    r['reviewed']=True
+                    if category!='현재 분류 유지':r['category']=category
+            st.session_state[key+'_revision']+=1
+            st.session_state[selection_key]=[]
+            st.rerun()
+        with st.expander('제외·이체·카드 연결 등 상세 설정'):
+            st.caption('사업과 무관한 거래, 계좌이체, 카드대금 등을 조정할 때만 사용하세요.')
+            details=pd.DataFrame([r for r in draft if r['id'] in visible_ids])[
+                ['id','description','source','account','treatment','card_account','include','reviewed','reason']]
+            details_key=snapshot_key+'_details_snapshot'
+            if details_key not in st.session_state:st.session_state[details_key]=details
+            detailed=st.data_editor(st.session_state[details_key],key=snapshot_key+'_details',hide_index=True,
+                disabled=['id','description','source','account','reason'],column_config={
+                    'id':None,'description':'거래 내역','source':'자료','account':'계좌/카드','reason':'분류 근거','include':'정산 포함','reviewed':'확인',
+                    'treatment':st.column_config.SelectboxColumn('처리 구분',options=TREATMENTS,required=True),
+                    'card_account':st.column_config.SelectboxColumn('납부 대상 카드',options=sorted({''}|{c['account'] for c in registered_cards}|{r['account'] for r in draft if r['source']=='카드'}|{r.get('card_account','') for r in draft}))},width='stretch')
+            detail_updates={r['id']:r for r in detailed.to_dict('records')}
+            for r in draft:
+                if r['id'] in detail_updates:
+                    values={f:detail_updates[r['id']][f] for f in ('treatment','card_account','include','reviewed')}
+                    values['card_account']=values.get('card_account') or ''
+                    if any(r.get(f)!=v for f,v in values.items()):
+                        r.update(values);edit_changed=True
+            treatment=st.selectbox('선택 거래 처리 구분', ['현재 값 유지']+TREATMENTS,key=key+'_bulk_treatment')
+            inclusion=st.selectbox('선택 거래 포함 여부',['현재 값 유지','모두 포함','모두 제외'],key=key+'_bulk_include')
+            if st.button('선택 거래 상세 설정 적용',key=key+'_bulk',disabled=not selected_ids):
                 for r in draft:
-                    if r['id'] in visible_ids:
-                        r['reviewed']=True
-                st.session_state[key+'_revision'] += 1
+                    if r['id'] in selected_ids:
+                        if treatment!='현재 값 유지':r['treatment']=treatment
+                        if inclusion!='현재 값 유지':r['include']=inclusion=='모두 포함'
+                st.session_state[key+'_revision']+=1
                 st.rerun()
-            if st.button('현재 검색 결과에 적용', key=key+'_bulk', disabled=not confirm):
-                ids = {r['id'] for r in visible}
-                for r in draft:
-                    if r['id'] in ids:
-                        r.update(category=category,treatment=treatment,reviewed=True)
-                        if inclusion != '현재 값 유지':
-                            r['include'] = inclusion == '모두 포함'
-                st.session_state[key+'_revision'] += 1
-                st.rerun()
+        if edit_changed:
+            st.session_state[key+'_revision']+=1
+            if draft_context is not None and draft_id:autosave(draft,key,draft_context,draft_id)
+            st.rerun()
     else:
         st.info('현재 조건에 해당하는 거래가 없습니다. 전체 내역은 확인 필요 필터를 해제하세요.')
     compare_duplicates(draft,key,batches)
@@ -408,10 +478,11 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
     return draft
 
 def rule_options(key):
-    remember = st.checkbox('이번에 확인한 포함 거래의 분류를 다음 업로드에 기억', value=True, key=key+'_remember')
-    scope = st.radio('기억 범위', ['동일 거래명·계좌·방향·금액', '동일 거래명·계좌·방향 (금액 무관)'], key=key+'_scope', horizontal=True)
-    st.caption('동일 이름의 용도가 다르면 금액 조건을 유지하세요. 서로 다른 분류가 겹치면 다음 업로드에서 다시 확인합니다.')
-    return remember, scope.startswith('동일 거래명·계좌·방향·금액')
+    with st.expander('분류 기억 설정'):
+        remember=st.checkbox('확인한 분류를 다음 업로드에 기억',value=True,key=key+'_remember')
+        scope=st.radio('기억 범위',['동일 거래명·계좌·방향·금액','동일 거래명·계좌·방향 (금액 무관)'],key=key+'_scope',horizontal=True)
+        st.caption('기본은 같은 거래명·계좌·금액일 때만 기억합니다.')
+    return remember,scope.startswith('동일 거래명·계좌·방향·금액')
 
 if view == '새 파일 정산':
     staged_rows, batches, profiles, problems, file_checks, parsed_for_summary = [], [], [], [], [], []
@@ -511,124 +582,146 @@ if view == '새 파일 정산':
                         file_checks.append(meta)
                     profiles.append(dict(id=digest(['native',native['format']]),native=True,format=native['format'],account=alias,source=native['source']))
                     continue
-                src=st.selectbox('자료 종류',['은행','카드'],key=key+'_source')
-                accounts=sorted({p['account'] for p in known_profiles if p['source']==src} | ({c['account'] for c in registered_cards} if src=='카드' else set()))
-                choice=st.selectbox('저장한 계좌/카드',accounts+['새로 등록'],key=key+'_account_choice')
-                account=st.text_input('계좌/카드 별칭',key=key+'_account') if choice=='새로 등록' else choice
-                meta=dict(id=digest([file_hash,src,account,index]),filename=file.name,source=src,account=account,source_rows=0,error_count=0)
                 try:
-                    sheets=[]
                     if file.name.lower().endswith('.csv'):
-                        encoding=st.selectbox('CSV 인코딩',['utf-8-sig','cp949'],key=key+'_encoding')
-                        raw=pd.read_csv(io.BytesIO(data),header=None,encoding=encoding);sheet='CSV'
+                        try:
+                            probe=pd.read_csv(io.BytesIO(data),header=None,encoding='utf-8-sig');probe_encoding='utf-8-sig'
+                        except UnicodeDecodeError:
+                            probe=pd.read_csv(io.BytesIO(data),header=None,encoding='cp949');probe_encoding='cp949'
+                        probe_sheet='CSV'
                     else:
-                        book=pd.ExcelFile(io.BytesIO(data));sheets=book.sheet_names
-                        prior=next((p for p in known_profiles if p['source']==src and p['account']==account and p.get('sheets')==sheets),None)
-                        default_sheet=prior['sheet'] if prior and prior['sheet'] in sheets else sheets[0]
-                        sheet=st.selectbox('시트',sheets,index=sheets.index(default_sheet),key=key+'_sheet')
-                        raw=pd.read_excel(book,sheet_name=sheet,header=None)
-                    raw=raw.dropna(axis=1,how='all')
-                    prior=next((p for p in known_profiles if p['source']==src and p['account']==account and p['sheet']==sheet
-                        and p['header']<len(raw) and p['id']==digest([src,account,sheet,[str(v).strip() for v in raw.iloc[p['header']].tolist()]])),None)
-                    header=int(st.number_input('제목 행 번호 (엑셀 기준)',1,max(1,len(raw)),(prior['header'] if prior else guess_header(raw))+1,key=key+'_header'))-1
-                    columns=[str(v).strip() for v in raw.iloc[header].tolist()]
-                    if len(set(columns))!=len(columns) or any(c in ('nan','') for c in columns):
-                        raise ValueError('빈 제목 또는 중복 열 이름을 확인하세요.')
-                    frame=raw.iloc[header+1:].copy();frame.columns=columns
-                    meta['source_rows']=len(frame)
-                    signature=digest([src,account,sheet,columns])
-                    saved=next((p for p in known_profiles if p['id']==signature),None)
-                    default_map=guess_columns(columns,card=src=='카드')
-                    if saved:
-                        default_map.update(saved['mapping'])
-                    card_kind=''
-                    month=''
-                    fee_included=True
-                    if src=='카드':
-                        kinds=['청구내역','승인내역']
-                        card_kind=st.radio('카드 파일 종류',kinds,index=kinds.index(saved.get('card_kind','청구내역')) if saved and saved.get('card_kind') in kinds else 0,key=key+'_kind',horizontal=True)
-                        if card_kind=='청구내역':
-                            month=st.text_input('파일 청구월 (청구월 열이 없을 때)',value=target_month,key=key+'_billmonth')
-                            fee_included=st.checkbox('청구금액에 당월 수수료가 이미 포함됨',value=saved.get('fee_included',True) if saved else True,key=key+'_fee_included')
-                            st.caption('일시불은 실제 사용월로 집계합니다. 할부는 이 명세서의 회차 원금과 수수료를 선택한 정산월에 반영합니다.')
+                        probe_book=pd.ExcelFile(io.BytesIO(data));probe_sheet=probe_book.sheet_names[0]
+                        probe=pd.read_excel(probe_book,sheet_name=probe_sheet,header=None)
+                    probe=probe.dropna(axis=1,how='all');probe_header=guess_header(probe)
+                    probe_columns=[str(v).strip() for v in probe.iloc[probe_header].tolist()]
+                    inferred_profile=next((p for p in known_profiles if p.get('sheet')==probe_sheet and p.get('id')==digest([p['source'],p['account'],probe_sheet,probe_columns])),None)
+                    card_hint=any(any(word in str(c).replace(' ','') for word in ('가맹점','이용일','승인일','승인금액','청구','할부','결제원금')) for c in probe_columns)
+                    inferred_source=inferred_profile['source'] if inferred_profile else ('카드' if card_hint or any(v in file.name.casefold() for v in ('card','카드')) else '은행')
+                    inferred_alias=inferred_profile['account'] if inferred_profile else (Path(file.name).stem.split('_')[0] if inferred_source=='카드' else '사업통장')
+                    st.caption(f'{inferred_source} 파일 · 날짜와 금액을 자동으로 읽습니다. 잘못 읽힌 경우에만 아래 설정을 변경하세요.')
+                except Exception as error:
+                    problems.append({'파일':file.name,'오류':str(error)})
+                    st.error('파일을 읽지 못했습니다. 엑셀 파일 형식을 확인하세요.');continue
+                with st.expander('파일 읽기 설정 · 자동 인식이 틀릴 때만 변경'):
+                    src=st.selectbox('자료 종류',['은행','카드'],index=1 if inferred_source=='카드' else 0,key=key+'_source')
+                    accounts=sorted({p['account'] for p in known_profiles if p['source']==src} | ({c['account'] for c in registered_cards} if src=='카드' else set()))
+                    choice=st.selectbox('저장한 계좌/카드',accounts+['새로 등록'],index=accounts.index(inferred_profile['account']) if inferred_profile and inferred_profile['account'] in accounts else 0,key=key+'_account_choice')
+                    account=st.text_input('계좌/카드 별칭',value=inferred_alias,key=key+'_account') if choice=='새로 등록' else choice
+                    meta=dict(id=digest([file_hash,src,account,index]),filename=file.name,source=src,account=account,source_rows=0,error_count=0)
+                    try:
+                        sheets=[]
+                        if file.name.lower().endswith('.csv'):
+                            encoding=st.selectbox('CSV 인코딩',['utf-8-sig','cp949'],index=1 if probe_encoding=='cp949' else 0,key=key+'_encoding')
+                            raw=pd.read_csv(io.BytesIO(data),header=None,encoding=encoding);sheet='CSV'
                         else:
-                            st.warning('일시불 승인내역은 실제 사용월에 반영합니다. 할부는 회차별 원금이 있는 명세서가 필요합니다.')
-                    is_bill=src=='카드' and card_kind=='청구내역'
-                    modes=['입금/출금 별도','양수=출금 (음수=환불)','양수=입금 (음수=출금)']
-                    if is_bill:
-                        amount_mode=modes[0]
-                    else:
-                        default_mode=saved.get('amount_mode',modes[0]) if saved else (modes[1] if src=='카드' and not default_map.get('outflow') else modes[0])
-                        amount_mode=st.selectbox('금액 방식',modes,index=modes.index(default_mode),key=key+'_amount_mode')
-                    mapping={}
-                    labels={'date':'최초 구매일 / 은행 거래일','description':'내역/거래처','outflow':'출금','inflow':'입금','amount':'부호 있는 금액',
-                            'external_id':'승인/거래번호 (선택)','billing_month':'청구월 열 (없으면 파일 청구월 사용)',
-                            'billing_amount':'이번 달 청구금액 (환불은 음수)','purchase_amount':'일시불 실제 사용금액 (리볼빙 원금과 구분)','purchase_total':'전체 구매금액 (참고용·선택)',
-                            'installment_number':'이번 할부 회차 또는 3/3 (선택)','installment_total':'전체 할부 개월/회차 (선택)',
-                            'fee':'이번 달 할부 수수료 (선택)'}
-                    fields=list(ALIASES)+list(CARD_ALIASES) if src=='카드' else list(ALIASES)
-                    for field in fields:
-                        used=True
-                        if is_bill and field in ('amount','outflow','inflow'): used=False
-                        if not is_bill and field in ('billing_month','billing_amount','fee'): used=False
-                        if not is_bill and field=='amount' and amount_mode==modes[0]: used=False
-                        if not is_bill and field in ('outflow','inflow') and amount_mode!=modes[0]: used=False
-                        if not used:
-                            mapping[field]='';continue
-                        opts=['']+columns;value=default_map.get(field,'')
-                        mapping[field]=st.selectbox(labels[field],opts,index=opts.index(value) if value in opts else 0,key=key+'_'+field,format_func=lambda x:x or '선택 안 함')
-                    if is_bill:
-                        charge_confirm=st.checkbox('청구금액 열이 전체 구매금액이 아닌 이번 달 청구액임을 확인했습니다',key=key+'_charge_confirm')
-                        if not charge_confirm:
-                            problems.append({'파일':file.name,'오류':'당월 청구금액 열 확인 필요'})
-                    st.caption('저장한 형식 적용' if saved else '처음 보는 형식 · 정상 저장 시 기억합니다')
-                    st.dataframe(frame.head(5),hide_index=True)
-                    parsed,errors=parse_rows(frame,mapping,src,account,file_hash,sheet,header,amount_mode,card_kind=card_kind or '승인내역',statement_month=month,fee_included=fee_included)
-                    if src=='카드':
-                        parsed=[use_in_month(r,target_month) for r in parsed]
-                    bid=digest([file_hash,src,account.strip(),sheet])
-                    meta.update(id=bid,source_rows=len(frame),error_count=len(errors),blank_rows=len(frame)-len(parsed)-len(errors),card_kind=card_kind or '은행 거래')
-                    parsed_for_summary.extend(parsed)
-                    if errors:
-                        problems.extend(errors);st.error('오류 행을 수정하기 전에는 저장할 수 없습니다.');st.dataframe(errors)
-                    if not parsed and not errors:
-                        st.warning('정상 거래가 없습니다. 실제 청구 없는 달이면 카드 누락 점검에서 사유를 기록하세요.')
-                    if parsed:
-                        if bid in saved_batch_ids:
-                            st.warning('이미 저장한 파일·시트입니다. 이번 저장에서 제외합니다.')
-                            meta['status']='이미 저장한 파일'
-                        elif bid not in {b['id'] for b in batches}:
-                            staged_rows.extend(parsed)
-                            batches.append(dict(meta,hash=file_hash,sheet=sheet,header=header,mapping=mapping,statement_month=month,fee_included=fee_included))
-                            profiles.append(dict(id=signature,source=src,account=account,sheet=sheet,sheets=sheets,header=header,mapping=mapping,amount_mode=amount_mode,card_kind=card_kind,fee_included=fee_included))
+                            book=pd.ExcelFile(io.BytesIO(data));sheets=book.sheet_names
+                            prior=next((p for p in known_profiles if p['source']==src and p['account']==account and p.get('sheets')==sheets),None)
+                            default_sheet=prior['sheet'] if prior and prior['sheet'] in sheets else sheets[0]
+                            sheet=st.selectbox('시트',sheets,index=sheets.index(default_sheet),key=key+'_sheet')
+                            raw=pd.read_excel(book,sheet_name=sheet,header=None)
+                        raw=raw.dropna(axis=1,how='all')
+                        prior=next((p for p in known_profiles if p['source']==src and p['account']==account and p['sheet']==sheet
+                            and p['header']<len(raw) and p['id']==digest([src,account,sheet,[str(v).strip() for v in raw.iloc[p['header']].tolist()]])),None)
+                        header=int(st.number_input('제목 행 번호 (엑셀 기준)',1,max(1,len(raw)),(prior['header'] if prior else guess_header(raw))+1,key=key+'_header'))-1
+                        columns=[str(v).strip() for v in raw.iloc[header].tolist()]
+                        if len(set(columns))!=len(columns) or any(c in ('nan','') for c in columns):
+                            raise ValueError('빈 제목 또는 중복 열 이름을 확인하세요.')
+                        frame=raw.iloc[header+1:].copy();frame.columns=columns
+                        meta['source_rows']=len(frame)
+                        signature=digest([src,account,sheet,columns])
+                        saved=next((p for p in known_profiles if p['id']==signature),None)
+                        default_map=guess_columns(columns,card=src=='카드')
+                        if saved:
+                            default_map.update(saved['mapping'])
+                        card_kind=''
+                        month=''
+                        fee_included=True
+                        if src=='카드':
+                            kinds=['청구내역','승인내역']
+                            card_kind=st.radio('카드 파일 종류',kinds,index=kinds.index(saved.get('card_kind')) if saved and saved.get('card_kind') in kinds else (0 if default_map.get('billing_amount') else 1),key=key+'_kind',horizontal=True)
+                            if card_kind=='청구내역':
+                                month=st.text_input('파일 청구월 (청구월 열이 없을 때)',value=target_month,key=key+'_billmonth')
+                                fee_included=st.checkbox('청구금액에 당월 수수료가 이미 포함됨',value=saved.get('fee_included',True) if saved else True,key=key+'_fee_included')
+                                st.caption('일시불은 실제 사용월로 집계합니다. 할부는 이 명세서의 회차 원금과 수수료를 선택한 정산월에 반영합니다.')
+                            else:
+                                st.warning('일시불 승인내역은 실제 사용월에 반영합니다. 할부는 회차별 원금이 있는 명세서가 필요합니다.')
+                        is_bill=src=='카드' and card_kind=='청구내역'
+                        modes=['입금/출금 별도','양수=출금 (음수=환불)','양수=입금 (음수=출금)']
+                        if is_bill:
+                            amount_mode=modes[0]
                         else:
-                            meta['status']='이번 업로드 중복 파일'
-                except Exception as e:
-                    meta.update(error_count=meta['source_rows'],status='설정 오류 · 저장 차단')
-                    problems.append({'파일':file.name,'오류':str(e)})
-                    st.error(f'파일 설정을 확인하세요: {e}')
+                            default_mode=saved.get('amount_mode',modes[0]) if saved else (modes[1] if src=='카드' and not default_map.get('outflow') else modes[0])
+                            amount_mode=st.selectbox('금액 방식',modes,index=modes.index(default_mode),key=key+'_amount_mode')
+                        mapping={}
+                        labels={'date':'최초 구매일 / 은행 거래일','description':'내역/거래처','outflow':'출금','inflow':'입금','amount':'부호 있는 금액',
+                                'external_id':'승인/거래번호 (선택)','billing_month':'청구월 열 (없으면 파일 청구월 사용)',
+                                'billing_amount':'이번 달 청구금액 (환불은 음수)','purchase_amount':'일시불 실제 사용금액 (리볼빙 원금과 구분)','purchase_total':'전체 구매금액 (참고용·선택)',
+                                'installment_number':'이번 할부 회차 또는 3/3 (선택)','installment_total':'전체 할부 개월/회차 (선택)',
+                                'fee':'이번 달 할부 수수료 (선택)'}
+                        fields=list(ALIASES)+list(CARD_ALIASES) if src=='카드' else list(ALIASES)
+                        for field in fields:
+                            used=True
+                            if is_bill and field in ('amount','outflow','inflow'): used=False
+                            if not is_bill and field in ('billing_month','billing_amount','fee'): used=False
+                            if not is_bill and field=='amount' and amount_mode==modes[0]: used=False
+                            if not is_bill and field in ('outflow','inflow') and amount_mode!=modes[0]: used=False
+                            if not used:
+                                mapping[field]='';continue
+                            opts=['']+columns;value=default_map.get(field,'')
+                            if value and value in mapping.values():value='' 
+                            mapping[field]=st.selectbox(labels[field],opts,index=opts.index(value) if value in opts else 0,key=key+'_'+field,format_func=lambda x:x or '선택 안 함')
+                        if is_bill and not (mapping.get('billing_amount')==default_map.get('billing_amount') and mapping.get('billing_amount')):
+                            charge_confirm=st.checkbox('청구금액 열이 전체 구매금액이 아닌 이번 달 청구액임을 확인했습니다',key=key+'_charge_confirm')
+                            if not charge_confirm:
+                                problems.append({'파일':file.name,'오류':'당월 청구금액 열 확인 필요'})
+                        st.caption('저장한 형식 적용' if saved else '처음 보는 형식 · 정상 저장 시 기억합니다')
+                        st.dataframe(frame.head(5),hide_index=True)
+                        parsed,errors=parse_rows(frame,mapping,src,account,file_hash,sheet,header,amount_mode,card_kind=card_kind or '승인내역',statement_month=month,fee_included=fee_included)
+                        if src=='카드':
+                            parsed=[use_in_month(r,target_month) for r in parsed]
+                        bid=digest([file_hash,src,account.strip(),sheet])
+                        meta.update(id=bid,source_rows=len(frame),error_count=len(errors),blank_rows=len(frame)-len(parsed)-len(errors),card_kind=card_kind or '은행 거래')
+                        parsed_for_summary.extend(parsed)
+                        if errors:
+                            problems.extend(errors);st.error('오류 행을 수정하기 전에는 저장할 수 없습니다.');st.dataframe(errors)
+                        if not parsed and not errors:
+                            st.warning('정상 거래가 없습니다. 실제 청구 없는 달이면 카드 누락 점검에서 사유를 기록하세요.')
+                        if parsed:
+                            if bid in saved_batch_ids:
+                                st.warning('이미 저장한 파일·시트입니다. 이번 저장에서 제외합니다.')
+                                meta['status']='이미 저장한 파일'
+                            elif bid not in {b['id'] for b in batches}:
+                                staged_rows.extend(parsed)
+                                batches.append(dict(meta,hash=file_hash,sheet=sheet,header=header,mapping=mapping,statement_month=month,fee_included=fee_included))
+                                profiles.append(dict(id=signature,source=src,account=account,sheet=sheet,sheets=sheets,header=header,mapping=mapping,amount_mode=amount_mode,card_kind=card_kind,fee_included=fee_included))
+                            else:
+                                meta['status']='이번 업로드 중복 파일'
+                    except Exception as e:
+                        meta.update(error_count=meta['source_rows'],status='설정 오류 · 저장 차단')
+                        problems.append({'파일':file.name,'오류':str(e)})
+                        st.error(f'파일 설정을 확인하세요: {e}')
                 file_checks.append(meta)
         if staged_rows:
             staged_rows=classify(staged_rows,store.settings('rule:'),store.rows(),legacy_mapping=legacy_mapping,legacy_excluded=legacy_excluded)
     if file_checks:
-        st.subheader('업로드 확인표')
-        overrides={r['id']:r for r in staged_rows}
-        summary_rows=[overrides.get(r['id'],r) for r in parsed_for_summary]
-        st.dataframe(pd.DataFrame(upload_summary(file_checks,summary_rows)),hide_index=True,width='stretch')
-        st.caption('원본 데이터 행 = 정상 거래 + 빈 행 + 소계/합계 제외 + 오류 행. 거래 없는 날짜가 곧 누락을 뜻하지는 않습니다. 원본 파일 전체 건수·합계와 대조하세요.')
-        other_months=sorted({r['month'] for r in summary_rows if r['month']!=target_month})
-        if other_months:
-            st.warning('정산 대상월 밖의 거래가 있습니다: '+', '.join(other_months)+' · 의도한 기간인지 확인하세요.')
+        with st.expander('업로드한 파일 확인 · '+str(len(file_checks))+'개'):
+            overrides={r['id']:r for r in staged_rows}
+            summary_rows=[overrides.get(r['id'],r) for r in parsed_for_summary]
+            st.dataframe(pd.DataFrame(upload_summary(file_checks,summary_rows)),hide_index=True,width='stretch')
+            st.caption('원본 데이터 행 = 정상 거래 + 빈 행 + 소계/합계 제외 + 오류 행. 거래 없는 날짜가 곧 누락을 뜻하지는 않습니다. 원본 파일 전체 건수·합계와 대조하세요.')
+            other_months=sorted({r['month'] for r in summary_rows if r['month']!=target_month})
+            if other_months:
+                st.warning('정산 대상월 밖의 거래가 있습니다: '+', '.join(other_months)+' · 의도한 기간인지 확인하세요.')
     if staged_rows:
         key='new_'+digest([staged_rows,profiles])[:16]
         # Preserve the current user's edits when newly available recommendations change.
-        ids={(r['id'],r['fingerprint']) for r in staged_rows}
+        ids={(r['id'],r['fingerprint'],r['month'],bool(r.get('outside_period'))) for r in staged_rows}
         for previous_key in list(st.session_state):
             prior=st.session_state[previous_key]
-            if previous_key.startswith('new_') and isinstance(prior,list) and prior and all(isinstance(r,dict) and 'id' in r for r in prior) and {(r['id'],r.get('fingerprint')) for r in prior}==ids:
+            if previous_key.startswith('new_') and isinstance(prior,list) and prior and all(isinstance(r,dict) and 'id' in r for r in prior) and {(r['id'],r.get('fingerprint'),r['month'],bool(r.get('outside_period'))) for r in prior}==ids:
                 key=previous_key
                 break
-        draft_id=digest(['upload',sorted(b['id'] for b in batches)])
+        draft_id=digest(['upload',target_month,sorted(b['id'] for b in batches)])
         draft_context=dict(kind='upload',month=target_month,batches=batches,profiles=profiles,problems=problems)
         draft=editor(staged_rows,key,batches,draft_context,draft_id)
         remember,scoped=rule_options(key)

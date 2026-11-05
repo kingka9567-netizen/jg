@@ -1,7 +1,10 @@
-streamlit
-pandas
+streamlit==1.55.0
+pandas>=2.2,<3
 plotly
 openpyxl
 gspread
 google-auth
 matplotlib
+psycopg[binary,pool]>=3.2,<4
+xlrd>=2.0,<3
+lxml>=5,<7

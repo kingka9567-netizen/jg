@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, date, timedelta
 import pandas as pd
 from .classification import suggest, needs_purpose
+from .layout import inspect_layout
 
 CATEGORIES = ['미분류', '판매대금 입금', '사입', '부자재', '세금', '택배비', '광고비',
               '식비', '구독/통신', '생활 및 기타', '기타']
@@ -130,13 +131,13 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
     if len(selected) != len(set(selected)):
         raise ValueError('서로 다른 항목에 같은 열을 지정할 수 없습니다')
     rows, errors = [], []
+    layout=inspect_layout(frame,mapping,transaction_date,money)
     batch_id = digest([file_hash, source, account.strip(), sheet])
     for pos, (_, raw) in enumerate(frame.iterrows()):
         number = pos + header + 2
         def cell(k):
             return raw[mapping[k]] if mapping.get(k) else None
-        # Ignore truly blank rows, never silently drop totals or malformed transactions.
-        if all(pd.isna(cell(k)) for k in mapping if mapping.get(k)):
+        if layout['kinds'][pos]!='transaction':
             continue
         try:
             d = transaction_date(cell('date'))
@@ -186,6 +187,9 @@ def parse_rows(frame, mapping, source, account, file_hash, sheet, header, amount
             rows.append(row)
         except (ValueError, TypeError, OverflowError) as e:
             errors.append({'엑셀 행': number, '오류': str(e)})
+    for check in layout['controls']:
+        if not check['passed']:
+            errors.append({'엑셀 행':check['row']+header+2,'오류':check['check']+' 불일치 또는 금액 오류','검산':True})
     return rows, errors
 
 def transaction_fingerprint(row):

@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from settlement.core import (CATEGORIES, TREATMENTS, ALIASES, CARD_ALIASES, digest, guess_columns,
-    guess_header, parse_rows, classify, learn_rules, metrics, csv_safe, billing_month, use_in_month)
+    guess_header, parse_rows, classify, learn_rules, metrics, csv_safe, billing_month, use_in_month, transaction_date, money)
 from settlement.originals import read_original
 from settlement.classification import review_groups, apply_groups, read_legacy_mapping
 from settlement.checks import upload_summary, coverage_checks, duplicate_comparisons
@@ -18,6 +18,7 @@ from settlement.store import Store, ConflictError
 from settlement.workflow import row_digest, ClosedPeriodError
 from settlement.report import monthly_xlsx
 from settlement.auth import LoginGate, valid_password
+from settlement.layout import inspect_layout
 
 st.set_page_config(page_title='월별 정산 내역', page_icon='📒', layout='wide')
 
@@ -393,7 +394,7 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
         st.session_state[key+'_revision']+=1
     st.session_state[selection_key]=list(selected_ids)
     rev=st.session_state[key+'_revision']
-    display_fields=['id','date','description','inflow','outflow','category']
+    display_fields=['id','date','description','inflow','outflow']
     labels=dict(selected='선택',date='거래 날짜',description='거래 내역',inflow='입금',outflow='출금',category='카테고리')
     snapshot_key=f'{key}_snapshot_{rev}_'+active_filter[:12]
     if snapshot_key not in st.session_state:
@@ -406,14 +407,10 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
         edited=st.data_editor(frame,key=snapshot_key+'_editor',hide_index=True,
             disabled=['id','date','description','inflow','outflow'],
             column_config={**{c:st.column_config.Column(label) for c,label in labels.items()},'id':None,
-                'category':st.column_config.SelectboxColumn('카테고리',options=cats,required=True)},width='stretch')
-        updates={r['id']:r for r in edited.to_dict('records')}
+                },width='stretch')
         selected_ids={r['id'] for r in edited.to_dict('records') if r['selected']}
         st.session_state[selection_key]=list(selected_ids)
         edit_changed=False
-        for r in draft:
-            if r['id'] in updates and r['category']!=updates[r['id']]['category']:
-                r['category']=updates[r['id']]['category'];edit_changed=True
         st.caption(f'선택 {len(selected_ids)}건 / 검색 결과 {len(visible_ids)}건 · 전체 선택은 현재 검색 결과에만 적용됩니다.')
         category=st.selectbox('선택 거래 카테고리', ['현재 분류 유지']+cats,key=key+'_bulk_category')
         if st.button('선택한 거래 확인',key=key+'_review',disabled=not selected_ids):
@@ -427,18 +424,19 @@ def editor(rows, key, batches=(), draft_context=None, draft_id=None):
         with st.expander('제외·이체·카드 연결 등 상세 설정'):
             st.caption('사업과 무관한 거래, 계좌이체, 카드대금 등을 조정할 때만 사용하세요.')
             details=pd.DataFrame([r for r in draft if r['id'] in visible_ids])[
-                ['id','description','source','account','treatment','card_account','include','reviewed','reason']]
+                ['id','description','source','account','category','treatment','card_account','include','reviewed','reason']]
             details_key=snapshot_key+'_details_snapshot'
             if details_key not in st.session_state:st.session_state[details_key]=details
             detailed=st.data_editor(st.session_state[details_key],key=snapshot_key+'_details',hide_index=True,
                 disabled=['id','description','source','account','reason'],column_config={
                     'id':None,'description':'거래 내역','source':'자료','account':'계좌/카드','reason':'분류 근거','include':'정산 포함','reviewed':'확인',
+                    'category':st.column_config.SelectboxColumn('카테고리',options=cats,required=True),
                     'treatment':st.column_config.SelectboxColumn('처리 구분',options=TREATMENTS,required=True),
                     'card_account':st.column_config.SelectboxColumn('납부 대상 카드',options=sorted({''}|{c['account'] for c in registered_cards}|{r['account'] for r in draft if r['source']=='카드'}|{r.get('card_account','') for r in draft}))},width='stretch')
             detail_updates={r['id']:r for r in detailed.to_dict('records')}
             for r in draft:
                 if r['id'] in detail_updates:
-                    values={f:detail_updates[r['id']][f] for f in ('treatment','card_account','include','reviewed')}
+                    values={f:detail_updates[r['id']][f] for f in ('category','treatment','card_account','include','reviewed')}
                     values['card_account']=values.get('card_account') or ''
                     if any(r.get(f)!=v for f,v in values.items()):
                         r.update(values);edit_changed=True
@@ -552,7 +550,8 @@ if view == '새 파일 정산':
                     continue
                 if native is not None:
                     prior=next((p for p in all_profiles if p.get('native') and p.get('format')==native['format']),None)
-                    alias=st.text_input('계좌/카드 별칭',value=prior['account'] if prior else native['alias'],key=key+'_native_alias').strip()
+                    with st.expander('계좌·카드 이름 변경'):
+                        alias=st.text_input('계좌/카드 별칭',value=prior['account'] if prior else native['alias'],key=key+'_native_alias').strip()
                     if not alias:
                         problems.append({'파일':file.name,'오류':'계좌/카드 별칭 필요'})
                         st.error('계좌/카드 별칭을 입력하세요.')
@@ -560,10 +559,12 @@ if view == '새 파일 정산':
                     if alias!=native['alias']:
                         native=read_original(data,file.name,target_month,alias)
                     st.success('원본 형식 자동 인식: '+native['format'])
-                    for note in native['notes']:
-                        st.caption(note)
-                    if native['controls']:
-                        st.dataframe(pd.DataFrame(native['controls']),hide_index=True)
+                    ignored=sum(b.get('ignored_rows',0)+b.get('blank_rows',0) for b in native['batches'])
+                    st.caption(f"거래 {len(native['rows'])}건 읽음 · 합계·안내·빈 행 {ignored}건 제외")
+                    st.caption('원본 합계 대조: '+native.get('reconciliation','대조 정보 없음'))
+                    with st.expander('읽기 결과 상세'):
+                        for note in native['notes']:st.caption(note)
+                        if native['controls']:st.dataframe(pd.DataFrame(native['controls']),hide_index=True)
                     if native['errors']:
                         problems.extend(native['errors'])
                         st.error('원본 검증 오류가 있어 저장을 차단합니다.')
@@ -680,7 +681,9 @@ if view == '새 파일 정산':
                         if src=='카드':
                             parsed=[use_in_month(r,target_month) for r in parsed]
                         bid=digest([file_hash,src,account.strip(),sheet])
-                        meta.update(id=bid,source_rows=len(frame),error_count=len(errors),blank_rows=len(frame)-len(parsed)-len(errors),card_kind=card_kind or '은행 거래')
+                        layout=inspect_layout(frame,mapping,transaction_date,money)
+                        meta.update(id=bid,source_rows=len(frame),error_count=sum(not e.get('검산') for e in errors),blank_rows=layout['blank_rows'],ignored_rows=layout['ignored_rows'],reconciliation=layout['status'],card_kind=card_kind or '은행 거래')
+                        st.caption(f"거래 {len(parsed)}건 읽음 · 합계·안내·빈 행 {layout['ignored_rows']+layout['blank_rows']}건 제외 · 원본 합계 대조: {layout['status']}")
                         parsed_for_summary.extend(parsed)
                         if errors:
                             problems.extend(errors);st.error('오류 행을 수정하기 전에는 저장할 수 없습니다.');st.dataframe(errors)

@@ -18,7 +18,7 @@ def upload_summary(batches, rows):
             '처리 상태':batch.get('status','검토 대상'),
             '원본 데이터 행':batch.get('source_rows',len(items)), '정상 거래':len(items),
             '빈 행':batch.get('blank_rows',0),'오류 행':batch.get('error_count',0),
-            '소계/합계 제외':batch.get('ignored_rows',0),
+            '소계/합계·안내 제외':batch.get('ignored_rows',0),'원본 합계 대조':batch.get('reconciliation','대조 정보 없음'),
             '구매/거래 기간':f'{dates[0]} ~ {dates[-1]}' if dates else '없음',
             '정산월':', '.join(sorted({r['month'] for r in items})),
             '입금/환불 합계':sum(r['inflow'] for r in items),

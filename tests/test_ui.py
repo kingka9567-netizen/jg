@@ -92,7 +92,7 @@ class UITests(unittest.TestCase):
             draft_key=next(k for k,v in at.session_state.filtered_state.items() if k.startswith('new_') and isinstance(v,list) and v and isinstance(v[0],dict) and 'id' in v[0])
             draft=at.session_state[draft_key]
             row_id=draft[0]['id']
-            table_key=next(k for k in at.session_state.filtered_state if k.endswith('_editor'))
+            table_key=next(k for k in at.session_state.filtered_state if k.endswith('_details'))
             at.session_state[table_key]={'edited_rows':{0:{'category':'세금'}},'added_rows':[],'deleted_rows':[]}
             at.run()
             store=Store('sqlite:///'+at.session_state['demo_path'])
@@ -291,12 +291,12 @@ class UITests(unittest.TestCase):
             self.assertTrue(cj['reviewed']);self.assertEqual(cj['category'],'부자재')
             self.assertEqual(sum(r['reviewed'] for r in draft),1)
 
-    def test_basic_table_has_only_selection_and_five_business_columns(self):
+    def test_basic_table_has_only_selection_and_four_business_columns(self):
         with patch.dict(os.environ,{'SETTLEMENT_MODE':'demo'}):
             at=AppTest.from_file(str(APP)).run()
             next(b for b in at.button if b.label=='가상 은행·카드 내역 불러오기').click().run()
             table=next(d.value for d in at.dataframe if 'selected' in d.value.columns and 'date' in d.value.columns)
-            self.assertEqual(list(table.columns),['selected','id','date','description','inflow','outflow','category'])
+            self.assertEqual(list(table.columns),['selected','id','date','description','inflow','outflow'])
             self.assertNotIn('installment_number',table)
             details=next(e for e in at.expander if e.label=='제외·이체·카드 연결 등 상세 설정')
             self.assertFalse(details.proto.expanded)
@@ -323,5 +323,35 @@ class UITests(unittest.TestCase):
                 next(t for t in good.text_input if t.label=='비밀번호').set_value('0042').run()
                 next(b for b in good.button if b.label=='로그인').click().run()
                 self.assertFalse(good.exception);self.assertTrue(any(r.label=='작업' for r in good.radio))
+
+    def test_modern_hyundai_has_no_column_mapping_and_total_does_not_error(self):
+        from test_layout import modern_hyundai
+        with tempfile.TemporaryDirectory() as tmp:
+            f=io.BytesIO(modern_hyundai(totals=True));f.name='raw.xlsx'
+            env={'SETTLEMENT_MODE':'local','SETTLEMENT_PASSWORD':'test-password-long-enough','SETTLEMENT_DATABASE_URL':'sqlite:///'+str(Path(tmp)/'native.sqlite3'),'SETTLEMENT_PREVIEW_MONTH':'2026-10'}
+            with patch.dict(os.environ,env),patch('streamlit.file_uploader',return_value=[f]):
+                at=AppTest.from_file(str(APP)).run();at.session_state['authenticated']=True;at.run()
+                self.assertFalse(at.exception);self.assertFalse(at.error)
+                self.assertEqual(at.metric[1].value,'215,000원')
+                self.assertFalse(any(s.label=='최초 구매일 / 은행 거래일' for s in at.selectbox))
+                self.assertFalse(any(e.label.startswith('파일 읽기 설정') for e in at.expander))
+                self.assertTrue(any('거래 4건 읽음' in c.value and '3건 제외' in c.value for c in at.caption))
+                self.assertTrue(any(c.value=='원본 합계 대조: 일치' for c in at.caption))
+                draft=Store(env['SETTLEMENT_DATABASE_URL']).drafts()[0]
+                self.assertEqual(len(draft['rows']),4)
+                self.assertEqual(draft['context']['batches'][0]['source_rows'],7)
+                self.assertEqual(draft['context']['batches'][0]['ignored_rows'],3)
+
+    def test_native_total_mismatch_blocks_save_with_no_manual_mapping(self):
+        from test_layout import modern_hyundai
+        with tempfile.TemporaryDirectory() as tmp:
+            f=io.BytesIO(modern_hyundai(totals=True,mismatch=True));f.name='raw.xlsx'
+            env={'SETTLEMENT_MODE':'local','SETTLEMENT_PASSWORD':'test-password-long-enough','SETTLEMENT_DATABASE_URL':'sqlite:///'+str(Path(tmp)/'native.sqlite3'),'SETTLEMENT_PREVIEW_MONTH':'2026-10'}
+            with patch.dict(os.environ,env),patch('streamlit.file_uploader',return_value=[f]):
+                at=AppTest.from_file(str(APP)).run();at.session_state['authenticated']=True;at.run()
+                self.assertFalse(at.exception)
+                self.assertTrue(any('검증 오류' in e.value for e in at.error))
+                self.assertTrue(next(b for b in at.button if b.label=='검토한 정산 저장').disabled)
+                self.assertFalse(any(e.label.startswith('파일 읽기 설정') for e in at.expander))
 
 if __name__=='__main__': unittest.main()
